@@ -20,13 +20,39 @@ create table if not exists profiles (
 
 alter table profiles enable row level security;
 
-create policy "Public profiles readable"
-  on profiles for select
-  using (true);
+-- Helper: read the caller's role without triggering RLS recursion on
+-- profiles. SECURITY DEFINER runs as owner and bypasses RLS.
+create or replace function public.current_user_role()
+returns text
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select role from public.profiles where id = auth.uid();
+$$;
 
-create policy "Own profile editable"
+revoke all on function public.current_user_role() from public;
+grant execute on function public.current_user_role() to authenticated;
+
+-- Clients see only their own profile; staff/admin see all. Public booking
+-- UI gets staff names via the API (service role), so no anon read here.
+create policy "Profiles select"
+  on profiles for select
+  using (
+    auth.uid() = id
+    or public.current_user_role() in ('staff', 'admin')
+  );
+
+-- A user may edit their own profile but may NOT change their role.
+-- Admins change roles through the API (service role bypasses RLS).
+create policy "Own profile update"
   on profiles for update
-  using (auth.uid() = id);
+  using (auth.uid() = id)
+  with check (
+    auth.uid() = id
+    and role = public.current_user_role()
+  );
 
 -- Auto-create a profile when a new user signs up
 create or replace function public.handle_new_user()
@@ -165,9 +191,17 @@ create policy "Client sees own appointments"
     )
   );
 
-create policy "Authenticated can create appointments"
+-- A direct client insert may only create an unpaid, pending request for
+-- themselves. Pricing, deposits, confirmation and conflict checks run in
+-- the API (service role bypasses this policy).
+create policy "Client creates pending appointment"
   on appointments for insert
-  with check (auth.uid() = client_id);
+  with check (
+    auth.uid() = client_id
+    and status = 'pending'
+    and coalesce(amount_paid_cents, 0) = 0
+    and coalesce(deposit_cents, 0) >= 0
+  );
 
 create policy "Staff/admin update appointments"
   on appointments for update
@@ -178,6 +212,17 @@ create policy "Staff/admin update appointments"
       where id = auth.uid() and role = 'admin'
     )
   );
+
+-- Database-level guarantee: one stylist cannot hold two overlapping
+-- (non-cancelled) appointments, even under a booking race.
+create extension if not exists btree_gist;
+
+alter table appointments
+  add constraint appointments_no_overlap
+  exclude using gist (
+    staff_id with =,
+    tstzrange(start_time, end_time) with &&
+  ) where (status <> 'cancelled');
 
 -- ──────────────────────────────────────────────────────────
 -- REMINDERS
@@ -193,4 +238,6 @@ create table if not exists reminders (
   created_at timestamptz default now()
 );
 
--- No RLS needed for reminders — only accessed server-side via service role key
+-- Reminders are only accessed server-side via the service role key (which
+-- bypasses RLS). Enable RLS with no policies to close the table to anon access.
+alter table reminders enable row level security;

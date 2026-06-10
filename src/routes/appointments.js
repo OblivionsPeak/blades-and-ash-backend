@@ -158,6 +158,11 @@ router.post('/', requireAuth, async (req, res) => {
     if (stripePaymentIntent) {
       await stripe.paymentIntents.cancel(stripePaymentIntent.id).catch(() => {});
     }
+    // 23P01 = exclusion_violation: the DB overlap constraint caught a booking
+    // race that slipped past the pre-check above.
+    if (insertError.code === '23P01') {
+      return res.status(409).json({ error: 'This time slot is no longer available. Please choose a different time.' });
+    }
     return res.status(500).json({ error: insertError.message });
   }
 
@@ -223,19 +228,13 @@ router.get('/:id', requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
-  // Authorization check
-  if (
-    userRole === 'client' && appointment.client_id !== userId &&
-    userRole === 'staff' && appointment.staff_id !== userId
-  ) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
+  // Authorization: clients see only their own, staff only theirs, admin all.
+  const canView =
+    userRole === 'admin' ||
+    (userRole === 'client' && appointment.client_id === userId) ||
+    (userRole === 'staff' && appointment.staff_id === userId);
 
-  if (userRole === 'client' && appointment.client_id !== userId) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-
-  if (userRole === 'staff' && appointment.staff_id !== userId) {
+  if (!canView) {
     return res.status(403).json({ error: 'Access denied' });
   }
 

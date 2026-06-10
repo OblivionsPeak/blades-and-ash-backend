@@ -21,13 +21,15 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // ──────────────────────────────────────────────
 // CORS
 // ──────────────────────────────────────────────
+// Never fall open to '*'. If FRONTEND_URL is unset, default to local dev
+// origins only — a config slip must not expose the API to every origin.
 const allowedOrigins = process.env.FRONTEND_URL
-  ? process.env.FRONTEND_URL.split(',').map(o => o.trim())
-  : ['*'];
+  ? process.env.FRONTEND_URL.split(',').map(o => o.trim()).filter(Boolean)
+  : ['http://localhost:5173'];
 
 app.use(
   cors({
-    origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
+    origin: allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
