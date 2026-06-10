@@ -1,0 +1,166 @@
+import cron from 'node-cron';
+import { supabase } from '../supabase.js';
+import { sendAppointmentReminder } from '../lib/email.js';
+import { sendSmsReminder } from '../lib/sms.js';
+
+/**
+ * Process pending reminders.
+ * Runs every 5 minutes.
+ * For each pending reminder, check if it's time to send based on
+ * appointment start_time and reminder type ('24h' or '2h').
+ */
+async function processReminders() {
+  console.log('[reminders] Running reminder check at', new Date().toISOString());
+
+  try {
+    // Fetch all pending reminders joined with appointment + client + service + staff
+    const { data: reminders, error } = await supabase
+      .from('reminders')
+      .select(`
+        id,
+        type,
+        channel,
+        status,
+        appointment_id,
+        appointment:appointments(
+          id,
+          start_time,
+          status,
+          client_id,
+          staff_id,
+          client:profiles!appointments_client_id_fkey(id, full_name, phone, email:id),
+          staff:profiles!appointments_staff_id_fkey(id, full_name),
+          service:services(id, name)
+        )
+      `)
+      .eq('status', 'pending')
+      .is('sent_at', null);
+
+    if (error) {
+      console.error('[reminders] Failed to fetch reminders:', error.message);
+      return;
+    }
+
+    if (!reminders || reminders.length === 0) {
+      console.log('[reminders] No pending reminders found.');
+      return;
+    }
+
+    const now = Date.now();
+
+    for (const reminder of reminders) {
+      const appointment = reminder.appointment;
+
+      // Skip if appointment doesn't exist or is cancelled/completed
+      if (!appointment) {
+        await markReminder(reminder.id, 'failed');
+        continue;
+      }
+
+      if (['cancelled', 'completed', 'no_show'].includes(appointment.status)) {
+        // Cancel this reminder since appointment is no longer active
+        await markReminder(reminder.id, 'failed');
+        continue;
+      }
+
+      const startTime = new Date(appointment.start_time).getTime();
+      const hoursOffset = reminder.type === '24h' ? 24 : 2;
+      const sendAfter = startTime - hoursOffset * 60 * 60 * 1000;
+
+      // Only send if we're past the "send after" time and the appointment is in the future
+      if (now < sendAfter) {
+        // Not yet time to send
+        continue;
+      }
+
+      if (now > startTime) {
+        // Appointment already started — mark as failed
+        await markReminder(reminder.id, 'failed');
+        continue;
+      }
+
+      // Gather required data
+      const clientProfile = appointment.client;
+      const staffProfile = appointment.staff;
+      const service = appointment.service;
+
+      if (!clientProfile || !service) {
+        await markReminder(reminder.id, 'failed');
+        continue;
+      }
+
+      try {
+        if (reminder.channel === 'email') {
+          // Fetch client email from auth.users via service role
+          const { data: userData, error: userError } = await supabase.auth.admin.getUserById(
+            appointment.client_id
+          );
+
+          if (userError || !userData?.user?.email) {
+            console.error(`[reminders] Could not find email for client ${appointment.client_id}`);
+            await markReminder(reminder.id, 'failed');
+            continue;
+          }
+
+          await sendAppointmentReminder({
+            to: userData.user.email,
+            clientName: clientProfile.full_name,
+            serviceName: service.name,
+            staffName: staffProfile?.full_name || 'Your stylist',
+            startTime: appointment.start_time,
+          });
+        } else if (reminder.channel === 'sms') {
+          if (!clientProfile.phone) {
+            console.warn(`[reminders] Client ${appointment.client_id} has no phone number, skipping SMS reminder.`);
+            await markReminder(reminder.id, 'failed');
+            continue;
+          }
+
+          await sendSmsReminder({
+            to: clientProfile.phone,
+            clientName: clientProfile.full_name,
+            serviceName: service.name,
+            startTime: appointment.start_time,
+          });
+        }
+
+        // Mark as sent
+        await supabase
+          .from('reminders')
+          .update({ status: 'sent', sent_at: new Date().toISOString() })
+          .eq('id', reminder.id);
+
+        console.log(`[reminders] Sent ${reminder.type} ${reminder.channel} reminder for appointment ${appointment.id}`);
+      } catch (sendError) {
+        console.error(
+          `[reminders] Failed to send ${reminder.type} ${reminder.channel} reminder for appointment ${appointment.id}:`,
+          sendError.message
+        );
+        await markReminder(reminder.id, 'failed');
+      }
+    }
+  } catch (err) {
+    console.error('[reminders] Unexpected error in processReminders:', err.message);
+  }
+}
+
+async function markReminder(reminderId, status) {
+  const { error } = await supabase
+    .from('reminders')
+    .update({ status, sent_at: status === 'sent' ? new Date().toISOString() : null })
+    .eq('id', reminderId);
+
+  if (error) {
+    console.error(`[reminders] Failed to update reminder ${reminderId} to status=${status}:`, error.message);
+  }
+}
+
+export function startReminderJob() {
+  // Run every 5 minutes
+  cron.schedule('*/5 * * * *', processReminders, {
+    scheduled: true,
+    timezone: 'America/New_York',
+  });
+
+  console.log('[reminders] Reminder cron job started — runs every 5 minutes.');
+}
