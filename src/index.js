@@ -21,9 +21,13 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // ──────────────────────────────────────────────
 // CORS
 // ──────────────────────────────────────────────
+const allowedOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(',').map(o => o.trim())
+  : ['*'];
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || '*',
+    origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
