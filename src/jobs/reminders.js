@@ -110,18 +110,9 @@ async function processReminders() {
             startTime: appointment.start_time,
           });
         } else if (reminder.channel === 'sms') {
-          if (!clientProfile.phone) {
-            console.warn(`[reminders] Client ${appointment.client_id} has no phone number, skipping SMS reminder.`);
-            await markReminder(reminder.id, 'failed');
-            continue;
-          }
-
-          await sendSmsReminder({
-            to: clientProfile.phone,
-            clientName: clientProfile.full_name,
-            serviceName: service.name,
-            startTime: appointment.start_time,
-          });
+          // SMS disabled until Twilio 10DLC registration is complete
+          await markReminder(reminder.id, 'failed');
+          continue;
         }
 
         // Mark as sent
