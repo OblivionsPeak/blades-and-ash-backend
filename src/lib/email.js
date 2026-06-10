@@ -14,7 +14,7 @@ export async function sendAppointmentReminder({ to, clientName, serviceName, sta
   });
 
   const { data, error } = await resend.emails.send({
-    from: 'Blades & Ash Studio <noreply@bladesandash.com>',
+    from: 'Blades & Ash Studio <onboarding@resend.dev>',
     to,
     subject: `Reminder: Your appointment at Blades & Ash Studio`,
     html: `
@@ -71,7 +71,7 @@ export async function sendBookingConfirmation({
   const deposit = depositCents ? (depositCents / 100).toFixed(2) : null;
 
   const { data, error } = await resend.emails.send({
-    from: 'Blades & Ash Studio <noreply@bladesandash.com>',
+    from: 'Blades & Ash Studio <onboarding@resend.dev>',
     to,
     subject: 'Booking Confirmed — Blades & Ash Studio',
     html: `
