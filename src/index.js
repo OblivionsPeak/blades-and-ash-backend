@@ -21,15 +21,29 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // ──────────────────────────────────────────────
 // CORS
 // ──────────────────────────────────────────────
-// Never fall open to '*'. If FRONTEND_URL is unset, default to local dev
-// origins only — a config slip must not expose the API to every origin.
-const allowedOrigins = process.env.FRONTEND_URL
-  ? process.env.FRONTEND_URL.split(',').map(o => o.trim()).filter(Boolean)
-  : ['http://localhost:5173'];
+// Origins allowed to call the API from a browser. We hardcode the known
+// production domains so a missing or partial FRONTEND_URL can't lock the
+// live site out of its own API, then merge in FRONTEND_URL plus local dev.
+// Never falls open to '*'.
+const defaultOrigins = [
+  'https://bladeandash.com',
+  'https://www.bladeandash.com',
+  'https://blades-and-ash.vercel.app',
+  'http://localhost:5173',
+];
+const envOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(origin, cb) {
+      // Allow non-browser requests (no Origin header) and any allowed origin
+      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
