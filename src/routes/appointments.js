@@ -4,6 +4,7 @@ import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { sendBookingConfirmation } from '../lib/email.js';
+import { resolveDiscount } from '../lib/discounts.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -57,7 +58,7 @@ router.get('/', requireAuth, async (req, res) => {
 
 // POST / — create appointment (requireAuth)
 router.post('/', requireAuth, async (req, res) => {
-  const { staff_id, service_id, start_time, client_notes } = req.body;
+  const { staff_id, service_id, start_time, client_notes, discount_code } = req.body;
   const clientId = req.user.id;
 
   if (!staff_id || !service_id || !start_time) {
@@ -104,10 +105,21 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'This time slot is no longer available. Please choose a different time.' });
   }
 
-  // Determine payment details
-  const totalCents = service.price_cents;
+  // Determine payment details. If a promo code is supplied, re-validate it
+  // server-side against this service and apply it to the total — never trust
+  // a client-sent amount. An invalid/expired/out-of-scope code is silently
+  // ignored (full price). The deposit is a fixed up-front amount, capped at
+  // the (possibly discounted) total.
+  let totalCents = service.price_cents;
+  if (discount_code) {
+    const result = await resolveDiscount(supabase, { code: discount_code, service });
+    if (result.ok) {
+      totalCents = result.discounted_cents;
+    }
+  }
+
   const depositRequired = service.deposit_required && service.deposit_cents > 0;
-  const depositCents = depositRequired ? service.deposit_cents : 0;
+  const depositCents = depositRequired ? Math.min(service.deposit_cents, totalCents) : 0;
 
   // Create appointment
   const appointmentData = {

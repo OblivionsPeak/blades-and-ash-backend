@@ -3,23 +3,25 @@ import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { sendBookingConfirmation } from '../lib/email.js';
+import { resolveDiscount } from '../lib/discounts.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // POST /create-intent — create a Stripe PaymentIntent for an appointment
 router.post('/create-intent', requireAuth, async (req, res) => {
-  const { appointment_id } = req.body;
+  const { appointment_id, discount_code } = req.body;
   const userId = req.user.id;
 
   if (!appointment_id) {
     return res.status(400).json({ error: 'appointment_id is required' });
   }
 
-  // Fetch the appointment
+  // Fetch the appointment (pull the service's price + category so we can
+  // re-validate any promo code server-side — we never trust client amounts).
   const { data: appointment, error: apptError } = await supabase
     .from('appointments')
-    .select('*, service:services(name)')
+    .select('*, service:services(name, price_cents, category)')
     .eq('id', appointment_id)
     .single();
 
@@ -35,10 +37,34 @@ router.post('/create-intent', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Cannot create payment for a cancelled appointment' });
   }
 
-  // Determine amount: use deposit_cents if set, otherwise total_cents
+  // ── Discount flow ──────────────────────────────────────────
+  // If a promo code is supplied, re-validate it server-side against this
+  // appointment's service. A valid code lowers the stored total_cents; an
+  // invalid/expired/out-of-scope code is silently ignored (full price). The
+  // deposit is a fixed up-front amount and is charged as-is — the discount
+  // is reflected in total_cents (and therefore the remaining balance).
+  let totalCents = appointment.total_cents;
+  if (discount_code && appointment.service) {
+    const result = await resolveDiscount(supabase, {
+      code: discount_code,
+      service: { price_cents: appointment.total_cents, category: appointment.service.category },
+    });
+    if (result.ok) {
+      totalCents = result.discounted_cents;
+      // Persist the discounted total so the balance owed stays correct.
+      await supabase
+        .from('appointments')
+        .update({ total_cents: totalCents })
+        .eq('id', appointment_id);
+    }
+  }
+
+  // Determine amount: use deposit_cents if set, otherwise the (possibly
+  // discounted) total. A deposit is capped at the total in case a discount
+  // drops the total below the configured deposit.
   const amountCents = appointment.deposit_cents > 0
-    ? appointment.deposit_cents
-    : appointment.total_cents;
+    ? Math.min(appointment.deposit_cents, totalCents)
+    : totalCents;
 
   if (!amountCents || amountCents <= 0) {
     return res.status(400).json({ error: 'No payment amount found for this appointment' });

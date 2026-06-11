@@ -85,6 +85,7 @@ create table if not exists services (
   price_cents int not null,
   deposit_required boolean default false,
   deposit_cents int,
+  category text,
   active boolean default true,
   created_at timestamptz default now()
 );
@@ -223,6 +224,31 @@ alter table appointments
     staff_id with =,
     tstzrange(start_time, end_time) with &&
   ) where (status <> 'cancelled');
+
+-- ──────────────────────────────────────────────────────────
+-- DISCOUNTS (promo codes)
+-- ──────────────────────────────────────────────────────────
+-- Codes are stored/compared UPPERCASE. `scope` is either the literal 'all'
+-- (applies to any service) or a service category name. `value` is a percent
+-- (1–100) for type 'percent' or an absolute amount in cents for type 'fixed'.
+create table if not exists discounts (
+  id uuid default gen_random_uuid() primary key,
+  code text unique not null,
+  type text check (type in ('percent', 'fixed')),
+  value int not null,
+  scope text not null default 'all',
+  expires_at timestamptz,
+  active boolean default true,
+  created_at timestamptz default now()
+);
+
+alter table discounts enable row level security;
+
+-- Reads are public (the booking UI previews codes); writes happen only via the
+-- service-role client in the API, which bypasses RLS.
+create policy "Public read discounts"
+  on discounts for select
+  using (true);
 
 -- ──────────────────────────────────────────────────────────
 -- REMINDERS

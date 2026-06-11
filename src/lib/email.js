@@ -107,6 +107,9 @@ export async function sendBookingConfirmation({
         <p style="margin-top:24px;color:#888;font-size:14px">
           Need to cancel or reschedule? Please contact us at least 24 hours in advance.
         </p>
+        <p style="margin-top:16px;color:#888;font-size:13px;line-height:1.5">
+          Cancellation policy: Cancellations within 48 hours of your appointment are charged 50% of the service. No-shows are charged 100% of the service.
+        </p>
         <p style="color:#C4A882;font-weight:600">Blades &amp; Ash Studio</p>
       </div>
     `,

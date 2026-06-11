@@ -19,7 +19,7 @@ router.get('/', async (req, res) => {
 
 // POST / — create service (admin only)
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
-  const { name, description, duration_minutes, price_cents, deposit_required, deposit_cents } = req.body;
+  const { name, description, duration_minutes, price_cents, deposit_required, deposit_cents, category } = req.body;
 
   if (!name || !duration_minutes || price_cents === undefined) {
     return res.status(400).json({ error: 'name, duration_minutes, and price_cents are required' });
@@ -42,6 +42,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       price_cents,
       deposit_required: deposit_required || false,
       deposit_cents: deposit_cents || null,
+      category: category || null,
       active: true,
     })
     .select()
@@ -54,7 +55,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
 // PUT /:id — update service (admin only)
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   const { id } = req.params;
-  const { name, description, duration_minutes, price_cents, deposit_required, deposit_cents, active } = req.body;
+  const { name, description, duration_minutes, price_cents, deposit_required, deposit_cents, active, category } = req.body;
 
   // Validate monetary values if provided
   if (price_cents !== undefined && (!Number.isInteger(price_cents) || price_cents < 0)) {
@@ -72,6 +73,7 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   if (deposit_required !== undefined) updates.deposit_required = deposit_required;
   if (deposit_cents !== undefined) updates.deposit_cents = deposit_cents;
   if (active !== undefined) updates.active = active;
+  if (category !== undefined) updates.category = category;
 
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No fields provided to update' });
