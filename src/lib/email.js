@@ -3,6 +3,11 @@ import 'dotenv/config';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// Branded sender. Override with RESEND_FROM once the bladeandash.com domain is
+// verified in Resend. Defaults to the branded address (the domain still needs
+// verification in Resend for delivery — that's a separate human step).
+const FROM_ADDRESS = process.env.RESEND_FROM || 'Blades & Ash <bookings@bladeandash.com>';
+
 export async function sendAppointmentReminder({ to, clientName, serviceName, staffName, startTime }) {
   const dateStr = new Date(startTime).toLocaleString('en-US', {
     weekday: 'long',
@@ -14,7 +19,7 @@ export async function sendAppointmentReminder({ to, clientName, serviceName, sta
   });
 
   const { data, error } = await resend.emails.send({
-    from: 'Blades & Ash Studio <onboarding@resend.dev>',
+    from: FROM_ADDRESS,
     to,
     subject: `Reminder: Your appointment at Blades & Ash Studio`,
     html: `
@@ -71,7 +76,7 @@ export async function sendBookingConfirmation({
   const deposit = depositCents ? (depositCents / 100).toFixed(2) : null;
 
   const { data, error } = await resend.emails.send({
-    from: 'Blades & Ash Studio <onboarding@resend.dev>',
+    from: FROM_ADDRESS,
     to,
     subject: 'Booking Confirmed — Blades & Ash Studio',
     html: `

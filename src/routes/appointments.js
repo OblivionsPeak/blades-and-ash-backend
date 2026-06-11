@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { sendBookingConfirmation } from '../lib/email.js';
 import { resolveDiscountForServices } from '../lib/discounts.js';
@@ -52,6 +52,26 @@ async function attachItems(appointments) {
     }
   }
 
+  return appointments;
+}
+
+// For appointments booked by a guest (client_id is null), the `client` join is
+// null. Synthesize a display object from the stored guest_* fields so admin/staff
+// lists can render "the client" uniformly. Mutates each appointment in place.
+function attachGuestDisplay(appointments) {
+  if (!appointments) return appointments;
+  const list = Array.isArray(appointments) ? appointments : [appointments];
+  for (const appt of list) {
+    if (!appt.client_id && !appt.client) {
+      appt.client = {
+        id: null,
+        full_name: appt.guest_name || 'Guest',
+        phone: appt.guest_phone || null,
+        avatar_url: null,
+        is_guest: true,
+      };
+    }
+  }
   return appointments;
 }
 
@@ -106,13 +126,30 @@ router.get('/', requireAuth, async (req, res) => {
     return res.status(500).json({ error: itemsError.message });
   }
 
+  attachGuestDisplay(data);
+
   return res.json(data);
 });
 
-// POST / — create appointment (requireAuth)
-router.post('/', requireAuth, async (req, res) => {
-  const { staff_id, service_id, service_ids, start_time, client_notes, discount_code } = req.body;
-  const clientId = req.user.id;
+// POST / — create appointment. Auth is OPTIONAL: signed-in clients book against
+// their own client_id; guests (no token) must supply guest_name/email/phone and
+// are stored with client_id = null. Pricing/duration/discount are always
+// computed server-side — guest amounts from the client are never trusted.
+router.post('/', optionalAuth, async (req, res) => {
+  const {
+    staff_id, service_id, service_ids, start_time, client_notes, discount_code,
+    guest_name, guest_email, guest_phone,
+  } = req.body;
+
+  const isGuest = !req.user;
+  const clientId = isGuest ? null : req.user.id;
+
+  // Guests must identify themselves so we can send a confirmation / contact them.
+  if (isGuest) {
+    if (!guest_name || !guest_email || !guest_phone) {
+      return res.status(400).json({ error: 'guest_name, guest_email, and guest_phone are required to book as a guest' });
+    }
+  }
 
   // Back-compat: accept either service_ids (array, one or more) or a single
   // service_id (treated as a one-element list).
@@ -207,6 +244,10 @@ router.post('/', requireAuth, async (req, res) => {
     total_cents: totalCents,
     deposit_cents: depositCents,
     amount_paid_cents: 0,
+    // Guest contact details (null for signed-in clients).
+    guest_name: isGuest ? guest_name : null,
+    guest_email: isGuest ? guest_email : null,
+    guest_phone: isGuest ? guest_phone : null,
   };
 
   let stripePaymentIntent = null;
@@ -218,10 +259,12 @@ router.post('/', requireAuth, async (req, res) => {
         amount: depositCents,
         currency: 'usd',
         metadata: {
-          client_id: clientId,
+          // Stripe metadata values must be strings; use '' for guest bookings.
+          client_id: clientId || '',
           staff_id,
           service_id: primaryService.id,
           service_name: primaryService.name,
+          guest_email: isGuest ? guest_email : '',
         },
         automatic_payment_methods: { enabled: true },
       });
@@ -298,8 +341,8 @@ router.post('/', requireAuth, async (req, res) => {
         : primaryService.name;
 
       await sendBookingConfirmation({
-        to: req.user.email,
-        clientName: req.user.profile.full_name,
+        to: isGuest ? guest_email : req.user.email,
+        clientName: isGuest ? guest_name : req.user.profile.full_name,
         serviceName,
         staffName: staffProfile?.full_name || 'Your stylist',
         startTime: start_time,
@@ -355,6 +398,8 @@ router.get('/:id', requireAuth, async (req, res) => {
   } catch (itemsError) {
     return res.status(500).json({ error: itemsError.message });
   }
+
+  attachGuestDisplay(appointment);
 
   return res.json(appointment);
 });

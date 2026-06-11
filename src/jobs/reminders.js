@@ -28,6 +28,9 @@ async function processReminders() {
           status,
           client_id,
           staff_id,
+          guest_name,
+          guest_email,
+          guest_phone,
           client:profiles!appointments_client_id_fkey(id, full_name, phone, email:id),
           staff:profiles!appointments_staff_id_fkey(id, full_name),
           service:services(id, name)
@@ -84,27 +87,42 @@ async function processReminders() {
       const staffProfile = appointment.staff;
       const service = appointment.service;
 
-      if (!clientProfile || !service) {
+      // A guest booking (client_id null) has no client profile join; it carries
+      // its contact details on the appointment row instead.
+      const isGuest = !appointment.client_id;
+
+      if ((!clientProfile && !isGuest) || !service) {
         await markReminder(reminder.id, 'failed');
         continue;
       }
 
+      const reminderClientName = isGuest
+        ? (appointment.guest_name || 'Valued Client')
+        : clientProfile.full_name;
+
       try {
         if (reminder.channel === 'email') {
-          // Fetch client email from auth.users via service role
-          const { data: userData, error: userError } = await supabase.auth.admin.getUserById(
-            appointment.client_id
-          );
+          // Resolve the recipient email: signed-in clients from auth.users,
+          // guests from the stored guest_email.
+          let to = null;
+          if (isGuest) {
+            to = appointment.guest_email || null;
+          } else {
+            const { data: userData, error: userError } = await supabase.auth.admin.getUserById(
+              appointment.client_id
+            );
+            if (!userError) to = userData?.user?.email || null;
+          }
 
-          if (userError || !userData?.user?.email) {
-            console.error(`[reminders] Could not find email for client ${appointment.client_id}`);
+          if (!to) {
+            console.error(`[reminders] Could not find email for appointment ${appointment.id}`);
             await markReminder(reminder.id, 'failed');
             continue;
           }
 
           await sendAppointmentReminder({
-            to: userData.user.email,
-            clientName: clientProfile.full_name,
+            to,
+            clientName: reminderClientName,
             serviceName: service.name,
             staffName: staffProfile?.full_name || 'Your stylist',
             startTime: appointment.start_time,

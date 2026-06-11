@@ -167,6 +167,11 @@ create table if not exists appointments (
   service_id uuid references services(id),
   start_time timestamptz not null,
   end_time timestamptz not null,
+  -- Guest booking: when client_id is null the appointment was booked without an
+  -- account; these hold the guest's contact details for confirmation/reminders.
+  guest_name text,
+  guest_email text,
+  guest_phone text,
   status text not null default 'pending'
     check (status in ('pending', 'confirmed', 'cancelled', 'completed', 'no_show')),
   notes text,

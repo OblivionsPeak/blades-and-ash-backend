@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import Stripe from 'stripe';
 
 import servicesRouter from './routes/services.js';
@@ -16,6 +17,10 @@ import { sendBookingConfirmation } from './lib/email.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Render terminates TLS at a proxy, so trust the first proxy hop — this makes
+// req.ip the real client IP, which the rate limiter keys on.
+app.set('trust proxy', 1);
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -99,13 +104,25 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         })
         .eq('id', appointment.id);
 
-      // Send confirmation email
+      // Send confirmation email. Signed-in clients are looked up in auth.users;
+      // guest bookings (client_id null) use the stored guest_email/guest_name.
       try {
-        const { data: userData } = await supabase.auth.admin.getUserById(appointment.client_id);
-        if (userData?.user?.email) {
+        let to = null;
+        let clientName = 'Valued Client';
+
+        if (appointment.client_id) {
+          const { data: userData } = await supabase.auth.admin.getUserById(appointment.client_id);
+          to = userData?.user?.email || null;
+          clientName = appointment.client?.full_name || 'Valued Client';
+        } else {
+          to = appointment.guest_email || null;
+          clientName = appointment.guest_name || 'Valued Client';
+        }
+
+        if (to) {
           await sendBookingConfirmation({
-            to: userData.user.email,
-            clientName: appointment.client?.full_name || 'Valued Client',
+            to,
+            clientName,
             serviceName: appointment.service?.name || 'Your service',
             staffName: appointment.staff?.full_name || 'Your stylist',
             startTime: appointment.start_time,
@@ -153,6 +170,31 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ──────────────────────────────────────────────
+// Rate limiting on public / abuse-prone write endpoints
+// ──────────────────────────────────────────────
+// Limits anonymous booking spam, discount-code brute forcing, and availability
+// scraping to 30 requests/min/IP. Applied as targeted middleware (NOT to the
+// Stripe webhook, which is verified by signature and called by Stripe, and NOT
+// to authenticated admin/staff routes). Returns 429 with a JSON error.
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // requests per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down and try again shortly.' },
+});
+
+// POST /api/appointments (guest/auth booking). The limiter only fires for the
+// booking write; reads on this router are governed by their own auth.
+app.use('/api/appointments', (req, res, next) =>
+  req.method === 'POST' ? publicLimiter(req, res, next) : next()
+);
+// POST /api/discounts/validate (public promo-code check).
+app.use('/api/discounts/validate', publicLimiter);
+// GET /api/availability (public slot lookup).
+app.use('/api/availability', publicLimiter);
 
 // ──────────────────────────────────────────────
 // API Routes

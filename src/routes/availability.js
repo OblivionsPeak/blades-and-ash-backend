@@ -1,14 +1,22 @@
 import { Router } from 'express';
+import { DateTime } from 'luxon';
 import { supabase } from '../supabase.js';
 
 const router = Router();
+
+// The salon's physical timezone. staff_availability start_time/end_time are
+// stored as bare wall-clock times ("09:00", "17:00") with no zone; they mean
+// 9am–5pm *in Clarksville, TN* (Central). We resolve them against this zone so
+// DST is handled correctly (CDT in summer, CST in winter).
+const SALON_TZ = process.env.SALON_TZ || 'America/Chicago';
 
 /**
  * GET /api/availability
  * Query params: staff_id, date (YYYY-MM-DD), and either service_id (single)
  *   or service_ids (comma-separated list for a multi-service booking).
  * Slots are sized by the SUMMED duration of all listed services.
- * Returns array of ISO datetime strings for available 30-min slots
+ * Returns array of ISO datetime strings (UTC instants) for available 30-min
+ * slots. The frontend renders these in the visitor's local zone.
  */
 router.get('/', async (req, res) => {
   const { staff_id, service_id, service_ids, date } = req.query;
@@ -28,8 +36,10 @@ router.get('/', async (req, res) => {
     return res.status(400).json({ error: 'date must be in YYYY-MM-DD format' });
   }
 
-  const parsedDate = new Date(date + 'T00:00:00Z');
-  if (isNaN(parsedDate.getTime())) {
+  // Anchor the requested calendar date at midnight in the SALON timezone. All
+  // wall-clock math below is done in this zone so DST is applied correctly.
+  const dayInSalonTz = DateTime.fromISO(date, { zone: SALON_TZ }).startOf('day');
+  if (!dayInSalonTz.isValid) {
     return res.status(400).json({ error: 'Invalid date provided' });
   }
 
@@ -51,9 +61,10 @@ router.get('/', async (req, res) => {
 
   const durationMinutes = services.reduce((sum, s) => sum + s.duration_minutes, 0);
 
-  // 2. Get staff_availability for the given day_of_week
-  // JavaScript getUTCDay(): 0=Sunday, 1=Monday, ..., 6=Saturday
-  const dayOfWeek = parsedDate.getUTCDay();
+  // 2. Get staff_availability for the given day_of_week — the day-of-week of
+  // the requested date *in the salon timezone*. Luxon weekday: 1=Mon..7=Sun;
+  // staff_availability.day_of_week is 0=Sun..6=Sat, so normalize Sunday(7)->0.
+  const dayOfWeek = dayInSalonTz.weekday % 7;
 
   const { data: availability, error: availError } = await supabase
     .from('staff_availability')
@@ -67,9 +78,11 @@ router.get('/', async (req, res) => {
     return res.json([]);
   }
 
-  // 3. Get existing appointments for that staff on that date (not cancelled)
-  const dayStart = date + 'T00:00:00.000Z';
-  const dayEnd = date + 'T23:59:59.999Z';
+  // 3. Get existing appointments for that staff overlapping that salon-local
+  // day. We compute the day's UTC bounds from the salon-local midnight..midnight
+  // so the window is correct regardless of zone/DST.
+  const dayStart = dayInSalonTz.toUTC().toISO();
+  const dayEnd = dayInSalonTz.plus({ days: 1 }).toUTC().toISO();
 
   const { data: existingAppointments, error: apptError } = await supabase
     .from('appointments')
@@ -77,48 +90,49 @@ router.get('/', async (req, res) => {
     .eq('staff_id', staff_id)
     .neq('status', 'cancelled')
     .gte('start_time', dayStart)
-    .lte('start_time', dayEnd);
+    .lt('start_time', dayEnd);
 
   if (apptError) {
     return res.status(500).json({ error: apptError.message });
   }
 
-  // 4. Generate 30-minute slots from availability window
-  // Parse start_time and end_time from "HH:MM:SS" format
+  // 4. Generate 30-minute slots from the availability window. start_time and
+  // end_time are bare "HH:MM[:SS]" wall-clock times in SALON_TZ on this date.
   const [startHour, startMin] = availability.start_time.split(':').map(Number);
   const [endHour, endMin] = availability.end_time.split(':').map(Number);
 
-  // Build availability window in minutes from midnight
+  // Availability window as salon-local wall-clock minutes from midnight.
   const availStartMinutes = startHour * 60 + startMin;
   const availEndMinutes = endHour * 60 + endMin;
 
+  const now = Date.now();
   const slots = [];
-  // Step through in 30-min increments, but the slot must end by availEnd
+
+  // Step through in 30-min increments; the slot must end by the window close.
   for (let slotStart = availStartMinutes; slotStart + durationMinutes <= availEndMinutes; slotStart += 30) {
     const slotEnd = slotStart + durationMinutes;
 
-    // Build ISO strings for this slot
-    const slotStartDate = new Date(date + 'T00:00:00.000Z');
-    slotStartDate.setUTCHours(Math.floor(slotStart / 60), slotStart % 60, 0, 0);
+    // Build the slot's UTC instants from salon-local wall-clock minutes. Adding
+    // minutes to the salon-local midnight (in SALON_TZ) yields the correct UTC
+    // instant even across a DST boundary.
+    const slotStartDt = dayInSalonTz.plus({ minutes: slotStart });
+    const slotEndDt = dayInSalonTz.plus({ minutes: slotEnd });
 
-    const slotEndDate = new Date(date + 'T00:00:00.000Z');
-    slotEndDate.setUTCHours(Math.floor(slotEnd / 60), slotEnd % 60, 0, 0);
+    const proposedStart = slotStartDt.toMillis();
+    const proposedEnd = slotEndDt.toMillis();
 
-    // 5. Check overlap with existing appointments
+    // 5. Check overlap with existing appointments.
     const hasOverlap = (existingAppointments || []).some((appt) => {
       const apptStart = new Date(appt.start_time).getTime();
       const apptEnd = new Date(appt.end_time).getTime();
-      const proposedStart = slotStartDate.getTime();
-      const proposedEnd = slotEndDate.getTime();
-
-      // Overlap condition: proposed starts before appt ends AND proposed ends after appt starts
+      // Overlap: proposed starts before appt ends AND proposed ends after appt starts
       return proposedStart < apptEnd && proposedEnd > apptStart;
     });
 
     if (!hasOverlap) {
       // Skip slots in the past
-      if (slotStartDate.getTime() > Date.now()) {
-        slots.push(slotStartDate.toISOString());
+      if (proposedStart > now) {
+        slots.push(slotStartDt.toUTC().toISO());
       }
     }
   }
