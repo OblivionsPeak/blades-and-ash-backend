@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
-import { resolveDiscount } from '../lib/discounts.js';
+import { resolveDiscount, resolveDiscountForServices } from '../lib/discounts.js';
 
 const router = Router();
 
@@ -125,23 +125,30 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 // Returns the price math so the booking UI can preview the discount; the
 // charged amount is re-validated server-side at payment time regardless.
 router.post('/validate', async (req, res) => {
-  const { code, service_id } = req.body;
+  const { code, service_id, service_ids } = req.body;
 
-  if (!code || !service_id) {
-    return res.status(400).json({ valid: false, error: 'code and service_id are required' });
+  // Back-compat: a single service_id is treated as a one-element list.
+  const ids = Array.isArray(service_ids) && service_ids.length > 0
+    ? service_ids
+    : (service_id ? [service_id] : []);
+
+  if (!code || ids.length === 0) {
+    return res.status(400).json({ valid: false, error: 'code and service_id(s) are required' });
   }
 
-  const { data: service, error: serviceError } = await supabase
+  const { data: services, error: serviceError } = await supabase
     .from('services')
     .select('id, price_cents, category')
-    .eq('id', service_id)
-    .single();
+    .in('id', ids);
 
-  if (serviceError || !service) {
+  if (serviceError) {
+    return res.status(500).json({ valid: false, error: serviceError.message });
+  }
+  if (!services || services.length !== ids.length) {
     return res.status(404).json({ valid: false, error: 'Service not found' });
   }
 
-  const result = await resolveDiscount(supabase, { code, service });
+  const result = await resolveDiscountForServices(supabase, { code, services });
 
   if (!result.ok) {
     return res.json({ valid: false, error: result.error });

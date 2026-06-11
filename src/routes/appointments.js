@@ -4,10 +4,56 @@ import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { sendBookingConfirmation } from '../lib/email.js';
-import { resolveDiscount } from '../lib/discounts.js';
+import { resolveDiscountForServices } from '../lib/discounts.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Attach an `items` array to each appointment from appointment_services
+// (joined to services for the name). For LEGACY appointments with no
+// appointment_services rows, synthesize a single item from the primary
+// `service` join so old bookings still render. Mutates and returns the input.
+async function attachItems(appointments) {
+  if (!appointments || appointments.length === 0) return appointments;
+
+  const ids = appointments.map((a) => a.id);
+  const { data: rows, error } = await supabase
+    .from('appointment_services')
+    .select('appointment_id, service_id, price_cents, duration_minutes, service:services(name)')
+    .in('appointment_id', ids);
+
+  if (error) throw new Error(error.message);
+
+  const byAppointment = new Map();
+  for (const row of rows || []) {
+    if (!byAppointment.has(row.appointment_id)) byAppointment.set(row.appointment_id, []);
+    byAppointment.get(row.appointment_id).push({
+      service_id: row.service_id,
+      name: row.service?.name ?? null,
+      price_cents: row.price_cents,
+      duration_minutes: row.duration_minutes,
+    });
+  }
+
+  for (const appt of appointments) {
+    const items = byAppointment.get(appt.id);
+    if (items && items.length > 0) {
+      appt.items = items;
+    } else if (appt.service) {
+      // Legacy fallback: synthesize from the primary service join.
+      appt.items = [{
+        service_id: appt.service.id,
+        name: appt.service.name,
+        price_cents: appt.service.price_cents,
+        duration_minutes: appt.service.duration_minutes,
+      }];
+    } else {
+      appt.items = [];
+    }
+  }
+
+  return appointments;
+}
 
 // GET / — list appointments (role-filtered)
 router.get('/', requireAuth, async (req, res) => {
@@ -53,16 +99,29 @@ router.get('/', requireAuth, async (req, res) => {
   const { data, error } = await query;
 
   if (error) return res.status(500).json({ error: error.message });
+
+  try {
+    await attachItems(data);
+  } catch (itemsError) {
+    return res.status(500).json({ error: itemsError.message });
+  }
+
   return res.json(data);
 });
 
 // POST / — create appointment (requireAuth)
 router.post('/', requireAuth, async (req, res) => {
-  const { staff_id, service_id, start_time, client_notes, discount_code } = req.body;
+  const { staff_id, service_id, service_ids, start_time, client_notes, discount_code } = req.body;
   const clientId = req.user.id;
 
-  if (!staff_id || !service_id || !start_time) {
-    return res.status(400).json({ error: 'staff_id, service_id, and start_time are required' });
+  // Back-compat: accept either service_ids (array, one or more) or a single
+  // service_id (treated as a one-element list).
+  const ids = Array.isArray(service_ids) && service_ids.length > 0
+    ? service_ids
+    : (service_id ? [service_id] : []);
+
+  if (!staff_id || ids.length === 0 || !start_time) {
+    return res.status(400).json({ error: 'staff_id, service_id(s), and start_time are required' });
   }
 
   // Validate start_time is in the future
@@ -74,20 +133,28 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'start_time must be in the future' });
   }
 
-  // Fetch service for duration and pricing
-  const { data: service, error: serviceError } = await supabase
+  // Fetch services for duration and pricing. Every requested service must
+  // exist and be active.
+  const { data: fetchedServices, error: serviceError } = await supabase
     .from('services')
     .select('*')
-    .eq('id', service_id)
-    .eq('active', true)
-    .single();
+    .in('id', ids)
+    .eq('active', true);
 
-  if (serviceError || !service) {
+  if (serviceError) {
+    return res.status(500).json({ error: serviceError.message });
+  }
+  if (!fetchedServices || fetchedServices.length !== ids.length) {
     return res.status(404).json({ error: 'Service not found or inactive' });
   }
 
-  // Calculate end_time
-  const endTimeDate = new Date(startTimeDate.getTime() + service.duration_minutes * 60 * 1000);
+  // Preserve the caller's order; ids[0] is the primary service.
+  const services = ids.map((id) => fetchedServices.find((s) => s.id === id));
+  const primaryService = services[0];
+
+  // SUMMED duration → end_time
+  const totalDuration = services.reduce((sum, s) => sum + s.duration_minutes, 0);
+  const endTimeDate = new Date(startTimeDate.getTime() + totalDuration * 60 * 1000);
   const end_time = endTimeDate.toISOString();
 
   // Double-book prevention: check for conflicting appointments
@@ -105,27 +172,34 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'This time slot is no longer available. Please choose a different time.' });
   }
 
-  // Determine payment details. If a promo code is supplied, re-validate it
-  // server-side against this service and apply it to the total — never trust
-  // a client-sent amount. An invalid/expired/out-of-scope code is silently
-  // ignored (full price). The deposit is a fixed up-front amount, capped at
-  // the (possibly discounted) total.
-  let totalCents = service.price_cents;
+  // Determine payment details. total is the SUM of service prices. If a promo
+  // code is supplied, re-validate it server-side against the full set and apply
+  // it to the total — never trust a client-sent amount. An invalid/expired/
+  // out-of-scope code is silently ignored (full price). The deposit is the SUM
+  // of per-service deposits (where deposit_required), capped at the (possibly
+  // discounted) total.
+  let totalCents = services.reduce((sum, s) => sum + s.price_cents, 0);
   if (discount_code) {
-    const result = await resolveDiscount(supabase, { code: discount_code, service });
+    const result = await resolveDiscountForServices(supabase, { code: discount_code, services });
     if (result.ok) {
       totalCents = result.discounted_cents;
     }
   }
 
-  const depositRequired = service.deposit_required && service.deposit_cents > 0;
-  const depositCents = depositRequired ? Math.min(service.deposit_cents, totalCents) : 0;
+  const depositSum = services.reduce(
+    (sum, s) => sum + (s.deposit_required && s.deposit_cents > 0 ? s.deposit_cents : 0),
+    0,
+  );
+  const depositRequired = depositSum > 0;
+  const depositCents = depositRequired ? Math.min(depositSum, totalCents) : 0;
 
-  // Create appointment
+  // Create appointment. service_id is the FIRST/primary service so existing
+  // single-service joins keep working; the full set is stored in
+  // appointment_services below.
   const appointmentData = {
     client_id: clientId,
     staff_id,
-    service_id,
+    service_id: primaryService.id,
     start_time,
     end_time,
     status: depositRequired ? 'pending' : 'confirmed',
@@ -146,8 +220,8 @@ router.post('/', requireAuth, async (req, res) => {
         metadata: {
           client_id: clientId,
           staff_id,
-          service_id,
-          service_name: service.name,
+          service_id: primaryService.id,
+          service_name: primaryService.name,
         },
         automatic_payment_methods: { enabled: true },
       });
@@ -178,6 +252,28 @@ router.post('/', requireAuth, async (req, res) => {
     return res.status(500).json({ error: insertError.message });
   }
 
+  // Insert one appointment_services row per service (price/duration snapshot).
+  const itemRows = services.map((s) => ({
+    appointment_id: appointment.id,
+    service_id: s.id,
+    price_cents: s.price_cents,
+    duration_minutes: s.duration_minutes,
+  }));
+
+  const { error: itemsError } = await supabase
+    .from('appointment_services')
+    .insert(itemRows);
+
+  if (itemsError) {
+    // Roll back the appointment (and any PaymentIntent) so we never leave an
+    // appointment without its service line items.
+    await supabase.from('appointments').delete().eq('id', appointment.id);
+    if (stripePaymentIntent) {
+      await stripe.paymentIntents.cancel(stripePaymentIntent.id).catch(() => {});
+    }
+    return res.status(500).json({ error: itemsError.message });
+  }
+
   // Insert reminder rows (24h and 2h before, both email + sms)
   const reminderRows = [
     { appointment_id: appointment.id, type: '24h', channel: 'email', status: 'pending' },
@@ -197,10 +293,14 @@ router.post('/', requireAuth, async (req, res) => {
         .eq('id', staff_id)
         .single();
 
+      const serviceName = services.length > 1
+        ? `${primaryService.name} and ${services.length - 1} more`
+        : primaryService.name;
+
       await sendBookingConfirmation({
         to: req.user.email,
         clientName: req.user.profile.full_name,
-        serviceName: service.name,
+        serviceName,
         staffName: staffProfile?.full_name || 'Your stylist',
         startTime: start_time,
         totalCents,
@@ -248,6 +348,12 @@ router.get('/:id', requireAuth, async (req, res) => {
 
   if (!canView) {
     return res.status(403).json({ error: 'Access denied' });
+  }
+
+  try {
+    await attachItems([appointment]);
+  } catch (itemsError) {
+    return res.status(500).json({ error: itemsError.message });
   }
 
   return res.json(appointment);

@@ -226,6 +226,25 @@ alter table appointments
   ) where (status <> 'cancelled');
 
 -- ──────────────────────────────────────────────────────────
+-- APPOINTMENT <-> SERVICES (multi-service bookings)
+-- ──────────────────────────────────────────────────────────
+-- One row per service in an appointment. The appointment runs as one
+-- back-to-back time block for a single stylist; price/duration are snapshotted
+-- here at booking time. `appointments.service_id` stays the FIRST/primary
+-- service so existing single-service joins keep working.
+create table if not exists appointment_services (
+  appointment_id uuid references appointments(id) on delete cascade,
+  service_id uuid references services(id),
+  price_cents int not null,
+  duration_minutes int not null,
+  primary key (appointment_id, service_id)
+);
+
+-- Accessed only server-side via the service role key (which bypasses RLS).
+-- Enable RLS with no policies to close the table to anon access.
+alter table appointment_services enable row level security;
+
+-- ──────────────────────────────────────────────────────────
 -- DISCOUNTS (promo codes)
 -- ──────────────────────────────────────────────────────────
 -- Codes are stored/compared UPPERCASE. `scope` is either the literal 'all'

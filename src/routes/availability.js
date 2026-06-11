@@ -5,14 +5,21 @@ const router = Router();
 
 /**
  * GET /api/availability
- * Query params: staff_id, service_id, date (YYYY-MM-DD)
+ * Query params: staff_id, date (YYYY-MM-DD), and either service_id (single)
+ *   or service_ids (comma-separated list for a multi-service booking).
+ * Slots are sized by the SUMMED duration of all listed services.
  * Returns array of ISO datetime strings for available 30-min slots
  */
 router.get('/', async (req, res) => {
-  const { staff_id, service_id, date } = req.query;
+  const { staff_id, service_id, service_ids, date } = req.query;
 
-  if (!staff_id || !service_id || !date) {
-    return res.status(400).json({ error: 'staff_id, service_id, and date are required query parameters' });
+  // Back-compat: a single service_id is treated as a one-element list.
+  const ids = service_ids
+    ? service_ids.split(',').map((s) => s.trim()).filter(Boolean)
+    : (service_id ? [service_id] : []);
+
+  if (!staff_id || ids.length === 0 || !date) {
+    return res.status(400).json({ error: 'staff_id, service_id(s), and date are required query parameters' });
   }
 
   // Validate date format
@@ -26,21 +33,23 @@ router.get('/', async (req, res) => {
     return res.status(400).json({ error: 'Invalid date provided' });
   }
 
-  // 1. Get the service to find duration_minutes
-  const { data: service, error: serviceError } = await supabase
+  // 1. Get the services to find the SUMMED duration_minutes
+  const { data: services, error: serviceError } = await supabase
     .from('services')
     .select('id, duration_minutes, active')
-    .eq('id', service_id)
-    .single();
+    .in('id', ids);
 
-  if (serviceError || !service) {
+  if (serviceError) {
+    return res.status(500).json({ error: serviceError.message });
+  }
+  if (!services || services.length !== ids.length) {
     return res.status(404).json({ error: 'Service not found' });
   }
-  if (!service.active) {
+  if (services.some((s) => !s.active)) {
     return res.status(400).json({ error: 'Service is not active' });
   }
 
-  const durationMinutes = service.duration_minutes;
+  const durationMinutes = services.reduce((sum, s) => sum + s.duration_minutes, 0);
 
   // 2. Get staff_availability for the given day_of_week
   // JavaScript getUTCDay(): 0=Sunday, 1=Monday, ..., 6=Saturday
