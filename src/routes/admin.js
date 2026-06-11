@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 
 const router = Router();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Clamp user-supplied pagination to sane integers so `limit=abc` or a huge
 // offset can't produce a NaN range or dump the whole table.
@@ -160,6 +162,140 @@ router.get('/clients', requireAuth, requireRole('admin'), async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ clients: data, total: count });
+});
+
+// POST /clients — manually create a client profile (admin only). Creates a
+// real auth user (confirmed, passwordless) so the client can later claim the
+// account with a password reset / magic link, then upserts the profile row.
+router.post('/clients', requireAuth, requireRole('admin'), async (req, res) => {
+  const fullName = typeof req.body.full_name === 'string' ? req.body.full_name.trim() : '';
+  const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : '';
+
+  if (!fullName || !email) {
+    return res.status(400).json({ error: 'full_name and email are required' });
+  }
+  if (fullName.length > 120 || email.length > 254 || phone.length > 30) {
+    return res.status(400).json({ error: 'Client details are too long' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Please provide a valid email address' });
+  }
+  if (phone && !/^[\d\s()+.\-]{7,}$/.test(phone)) {
+    return res.status(400).json({ error: 'Please provide a valid phone number' });
+  }
+
+  const { data: created, error: authError } = await supabase.auth.admin.createUser({
+    email,
+    email_confirm: true,
+    user_metadata: { full_name: fullName },
+  });
+
+  if (authError) {
+    if (/already (been )?registered|already exists/i.test(authError.message)) {
+      return res.status(409).json({ error: 'A user with this email already exists' });
+    }
+    return res.status(500).json({ error: authError.message });
+  }
+
+  // A handle_new_user trigger may or may not have created the profile row —
+  // upsert covers both cases.
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .upsert(
+      { id: created.user.id, full_name: fullName, phone: phone || null, role: 'client' },
+      { onConflict: 'id' },
+    )
+    .select()
+    .single();
+
+  if (profileError) {
+    // Don't leave an orphaned auth user behind.
+    await supabase.auth.admin.deleteUser(created.user.id).catch(() => {});
+    return res.status(500).json({ error: profileError.message });
+  }
+
+  return res.status(201).json({ client: { ...profile, email } });
+});
+
+// POST /clients/:id/card-setup — start saving a card on file (admin only).
+// Creates the Stripe Customer if needed and returns a SetupIntent client
+// secret; the admin UI confirms it with Stripe Elements so the raw card
+// number never touches this server.
+router.post('/clients/:id/card-setup', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('id, full_name, stripe_customer_id')
+    .eq('id', id)
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (error) return res.status(500).json({ error: error.message });
+
+  try {
+    let customerId = profile.stripe_customer_id;
+
+    if (!customerId) {
+      const { data: authUser } = await supabase.auth.admin.getUserById(id);
+      const customer = await stripe.customers.create({
+        name: profile.full_name || undefined,
+        email: authUser?.user?.email || undefined,
+        metadata: { profile_id: id },
+      });
+      customerId = customer.id;
+
+      const { error: saveError } = await supabase
+        .from('profiles')
+        .update({ stripe_customer_id: customerId })
+        .eq('id', id);
+      if (saveError) return res.status(500).json({ error: saveError.message });
+    }
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      usage: 'off_session',
+      payment_method_types: ['card'],
+    });
+
+    return res.json({ client_secret: setupIntent.client_secret });
+  } catch (stripeError) {
+    return res.status(500).json({ error: `Stripe error: ${stripeError.message}` });
+  }
+});
+
+// GET /clients/:id/cards — list cards on file (admin only). Brand/last4 only.
+router.get('/clients/:id/cards', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('stripe_customer_id')
+    .eq('id', id)
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (error) return res.status(500).json({ error: error.message });
+  if (!profile.stripe_customer_id) return res.json({ cards: [] });
+
+  try {
+    const methods = await stripe.paymentMethods.list({
+      customer: profile.stripe_customer_id,
+      type: 'card',
+    });
+    return res.json({
+      cards: methods.data.map((pm) => ({
+        id: pm.id,
+        brand: pm.card.brand,
+        last4: pm.card.last4,
+        exp_month: pm.card.exp_month,
+        exp_year: pm.card.exp_year,
+      })),
+    });
+  } catch (stripeError) {
+    return res.status(500).json({ error: `Stripe error: ${stripeError.message}` });
+  }
 });
 
 // PUT /profiles/:id/role — change a user's role (admin only)

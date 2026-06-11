@@ -138,11 +138,36 @@ router.get('/', requireAuth, async (req, res) => {
 router.post('/', optionalAuth, async (req, res) => {
   const {
     staff_id, service_id, service_ids, start_time, client_notes, discount_code,
-    guest_name, guest_email, guest_phone,
+    guest_name, guest_email, guest_phone, client_id,
   } = req.body;
 
   const isGuest = !req.user;
-  const clientId = isGuest ? null : req.user.id;
+
+  // Admins may book ON BEHALF of a client (walk-in / phone booking) by
+  // passing client_id. Non-admins always book for themselves.
+  const isAdminBooking = !!(req.user && req.user.profile.role === 'admin'
+    && client_id && client_id !== req.user.id);
+  const clientId = isGuest ? null : (isAdminBooking ? client_id : req.user.id);
+
+  // The booked-for client's name/email, used for the confirmation email. For
+  // self-bookings this is the requesting user; for admin bookings it's looked
+  // up below; for guests it's the guest_* fields.
+  let bookedForName = req.user?.profile?.full_name || null;
+  let bookedForEmail = req.user?.email || null;
+  if (isAdminBooking) {
+    const { data: clientProfile, error: clientError } = await supabase
+      .from('profiles')
+      .select('id, full_name')
+      .eq('id', client_id)
+      .single();
+    if (clientError && clientError.code === 'PGRST116') {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+    if (clientError) return res.status(500).json({ error: clientError.message });
+    bookedForName = clientProfile.full_name;
+    const { data: authUser } = await supabase.auth.admin.getUserById(client_id);
+    bookedForEmail = authUser?.user?.email || null;
+  }
 
   // Guests must identify themselves so we can send a confirmation / contact
   // them. The frontend validates too, but this endpoint is public — validate
@@ -251,7 +276,9 @@ router.post('/', optionalAuth, async (req, res) => {
     (sum, s) => sum + (s.deposit_required && s.deposit_cents > 0 ? s.deposit_cents : 0),
     0,
   );
-  const depositRequired = depositSum > 0;
+  // Admin (walk-in/phone) bookings skip the online deposit — payment is
+  // settled at the salon — so the appointment is confirmed immediately.
+  const depositRequired = depositSum > 0 && !isAdminBooking;
   const depositCents = depositRequired ? Math.min(depositSum, totalCents) : 0;
 
   // Create appointment. service_id is the FIRST/primary service so existing
@@ -364,15 +391,18 @@ router.post('/', optionalAuth, async (req, res) => {
         ? `${primaryService.name} and ${services.length - 1} more`
         : primaryService.name;
 
-      await sendBookingConfirmation({
-        to: isGuest ? guestEmail : req.user.email,
-        clientName: isGuest ? guestName : req.user.profile.full_name,
-        serviceName,
-        staffName: staffProfile?.full_name || 'Your stylist',
-        startTime: start_time,
-        totalCents,
-        depositCents: null,
-      });
+      const confirmTo = isGuest ? guestEmail : bookedForEmail;
+      if (confirmTo) {
+        await sendBookingConfirmation({
+          to: confirmTo,
+          clientName: isGuest ? guestName : (bookedForName || 'there'),
+          serviceName,
+          staffName: staffProfile?.full_name || 'Your stylist',
+          startTime: start_time,
+          totalCents,
+          depositCents: null,
+        });
+      }
     } catch (emailError) {
       // Non-fatal: log but don't fail the request
       console.error('Failed to send confirmation email:', emailError.message);
