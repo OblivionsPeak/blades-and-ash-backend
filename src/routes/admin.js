@@ -5,6 +5,14 @@ import { requireRole } from '../middleware/requireRole.js';
 
 const router = Router();
 
+// Clamp user-supplied pagination to sane integers so `limit=abc` or a huge
+// offset can't produce a NaN range or dump the whole table.
+function clampPagination(limit, offset, { maxLimit = 200 } = {}) {
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), maxLimit);
+  const off = Math.max(parseInt(offset, 10) || 0, 0);
+  return { lim, off };
+}
+
 // GET /dashboard — dashboard stats (admin and staff)
 router.get('/dashboard', requireAuth, requireRole('admin', 'staff'), async (req, res) => {
   const now = new Date();
@@ -86,9 +94,10 @@ router.get('/dashboard', requireAuth, requireRole('admin', 'staff'), async (req,
 
 // GET /appointments — admin view of all appointments with filters
 router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (req, res) => {
-  const { status, staff_id, date, from, to, limit = 50, offset = 0 } = req.query;
+  const { status, staff_id, date, from, to, limit, offset } = req.query;
   const userRole = req.user.profile.role;
   const userId = req.user.id;
+  const { lim, off } = clampPagination(limit, offset);
 
   let query = supabase
     .from('appointments')
@@ -97,9 +106,9 @@ router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (r
       client:profiles!appointments_client_id_fkey(id, full_name, phone, avatar_url),
       staff:profiles!appointments_staff_id_fkey(id, full_name, avatar_url),
       service:services(id, name, duration_minutes, price_cents)
-    `)
+    `, { count: 'exact' })
     .order('start_time', { ascending: false })
-    .range(Number(offset), Number(offset) + Number(limit) - 1);
+    .range(off, off + lim - 1);
 
   // Staff can only see their own appointments
   if (userRole === 'staff') {
@@ -128,17 +137,23 @@ router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (r
 
 // GET /clients — list all client profiles (admin only)
 router.get('/clients', requireAuth, requireRole('admin'), async (req, res) => {
-  const { search, limit = 50, offset = 0 } = req.query;
+  const { search, limit, offset } = req.query;
+  const { lim, off } = clampPagination(limit, offset);
 
   let query = supabase
     .from('profiles')
     .select('*', { count: 'exact' })
     .eq('role', 'client')
     .order('full_name')
-    .range(Number(offset), Number(offset) + Number(limit) - 1);
+    .range(off, off + lim - 1);
 
   if (search) {
-    query = query.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%`);
+    // The PostgREST .or() filter string parses commas/parens as syntax —
+    // strip them (plus wildcards) so a search term can't alter the filter.
+    const safe = String(search).replace(/[,()%_]/g, ' ').trim().slice(0, 100);
+    if (safe) {
+      query = query.or(`full_name.ilike.%${safe}%,phone.ilike.%${safe}%`);
+    }
   }
 
   const { data, error, count } = await query;

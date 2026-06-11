@@ -50,13 +50,20 @@ router.put('/:id/availability', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'slots must be an array of { day_of_week, start_time, end_time }' });
   }
 
-  // Validate each slot
+  // Validate each slot. Times must be HH:MM[:SS] wall-clock strings — the
+  // availability route parses them numerically, so anything else silently
+  // produces NaN math and zero bookable slots for that day.
+  const timeRe = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
   for (const slot of slots) {
     if (slot.day_of_week === undefined || slot.day_of_week < 0 || slot.day_of_week > 6) {
       return res.status(400).json({ error: 'day_of_week must be between 0 (Sunday) and 6 (Saturday)' });
     }
-    if (!slot.start_time || !slot.end_time) {
-      return res.status(400).json({ error: 'Each slot requires start_time and end_time' });
+    if (!timeRe.test(slot.start_time || '') || !timeRe.test(slot.end_time || '')) {
+      return res.status(400).json({ error: 'Each slot requires start_time and end_time in HH:MM format' });
+    }
+    const toMinutes = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+    if (toMinutes(slot.start_time) >= toMinutes(slot.end_time)) {
+      return res.status(400).json({ error: 'start_time must be before end_time' });
     }
   }
 
