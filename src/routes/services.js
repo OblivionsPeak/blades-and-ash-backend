@@ -73,7 +73,7 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   if (deposit_required !== undefined) updates.deposit_required = deposit_required;
   if (deposit_cents !== undefined) updates.deposit_cents = deposit_cents;
   if (active !== undefined) updates.active = active;
-  if (category !== undefined) updates.category = category;
+  if (category !== undefined) updates.category = category || null;
 
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No fields provided to update' });
