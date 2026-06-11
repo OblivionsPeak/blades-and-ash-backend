@@ -144,10 +144,28 @@ router.post('/', optionalAuth, async (req, res) => {
   const isGuest = !req.user;
   const clientId = isGuest ? null : req.user.id;
 
-  // Guests must identify themselves so we can send a confirmation / contact them.
+  // Guests must identify themselves so we can send a confirmation / contact
+  // them. The frontend validates too, but this endpoint is public — validate
+  // shape and length server-side so junk can't reach the DB or the mailer.
+  let guestName = null;
+  let guestEmail = null;
+  let guestPhone = null;
   if (isGuest) {
-    if (!guest_name || !guest_email || !guest_phone) {
+    guestName = typeof guest_name === 'string' ? guest_name.trim() : '';
+    guestEmail = typeof guest_email === 'string' ? guest_email.trim() : '';
+    guestPhone = typeof guest_phone === 'string' ? guest_phone.trim() : '';
+
+    if (!guestName || !guestEmail || !guestPhone) {
       return res.status(400).json({ error: 'guest_name, guest_email, and guest_phone are required to book as a guest' });
+    }
+    if (guestName.length > 120 || guestEmail.length > 254 || guestPhone.length > 30) {
+      return res.status(400).json({ error: 'Guest contact details are too long' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail)) {
+      return res.status(400).json({ error: 'Please provide a valid email address' });
+    }
+    if (!/^[\d\s()+.\-]{7,}$/.test(guestPhone)) {
+      return res.status(400).json({ error: 'Please provide a valid phone number' });
     }
   }
 
@@ -159,6 +177,12 @@ router.post('/', optionalAuth, async (req, res) => {
 
   if (!staff_id || ids.length === 0 || !start_time) {
     return res.status(400).json({ error: 'staff_id, service_id(s), and start_time are required' });
+  }
+  if (ids.length > 10 || new Set(ids).size !== ids.length) {
+    return res.status(400).json({ error: 'service_ids must be at most 10 unique services' });
+  }
+  if (client_notes && (typeof client_notes !== 'string' || client_notes.length > 2000)) {
+    return res.status(400).json({ error: 'client_notes must be a string of at most 2000 characters' });
   }
 
   // Validate start_time is in the future
@@ -245,9 +269,9 @@ router.post('/', optionalAuth, async (req, res) => {
     deposit_cents: depositCents,
     amount_paid_cents: 0,
     // Guest contact details (null for signed-in clients).
-    guest_name: isGuest ? guest_name : null,
-    guest_email: isGuest ? guest_email : null,
-    guest_phone: isGuest ? guest_phone : null,
+    guest_name: guestName,
+    guest_email: guestEmail,
+    guest_phone: guestPhone,
   };
 
   let stripePaymentIntent = null;
@@ -264,7 +288,7 @@ router.post('/', optionalAuth, async (req, res) => {
           staff_id,
           service_id: primaryService.id,
           service_name: primaryService.name,
-          guest_email: isGuest ? guest_email : '',
+          guest_email: guestEmail || '',
         },
         automatic_payment_methods: { enabled: true },
       });
@@ -341,8 +365,8 @@ router.post('/', optionalAuth, async (req, res) => {
         : primaryService.name;
 
       await sendBookingConfirmation({
-        to: isGuest ? guest_email : req.user.email,
-        clientName: isGuest ? guest_name : req.user.profile.full_name,
+        to: isGuest ? guestEmail : req.user.email,
+        clientName: isGuest ? guestName : req.user.profile.full_name,
         serviceName,
         staffName: staffProfile?.full_name || 'Your stylist',
         startTime: start_time,
@@ -380,6 +404,8 @@ router.get('/:id', requireAuth, async (req, res) => {
     .eq('id', id)
     .single();
 
+  // PGRST116 = no rows matched .single() — a missing id, not a server fault.
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
   if (error) return res.status(500).json({ error: error.message });
   if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
@@ -432,6 +458,7 @@ router.put('/:id', requireAuth, requireRole('staff', 'admin'), async (req, res) 
     .select()
     .single();
 
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: 'Appointment not found' });
   return res.json(data);
@@ -450,6 +477,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
     .eq('id', id)
     .single();
 
+  if (fetchError && fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
   if (fetchError) return res.status(500).json({ error: fetchError.message });
   if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 

@@ -29,6 +29,9 @@ router.get('/', async (req, res) => {
   if (!staff_id || ids.length === 0 || !date) {
     return res.status(400).json({ error: 'staff_id, service_id(s), and date are required query parameters' });
   }
+  if (ids.length > 10) {
+    return res.status(400).json({ error: 'service_ids must list at most 10 services' });
+  }
 
   // Validate date format
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;

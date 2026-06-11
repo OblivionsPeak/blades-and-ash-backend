@@ -8,6 +8,17 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 // verification in Resend for delivery — that's a separate human step).
 const FROM_ADDRESS = process.env.RESEND_FROM || 'Blades & Ash <bookings@bladeandash.com>';
 
+// Guest-supplied values (names, etc.) end up in these templates — escape them
+// so a crafted booking can't inject HTML into mail sent from our domain.
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export async function sendAppointmentReminder({ to, clientName, serviceName, staffName, startTime }) {
   const dateStr = new Date(startTime).toLocaleString('en-US', {
     weekday: 'long',
@@ -25,16 +36,16 @@ export async function sendAppointmentReminder({ to, clientName, serviceName, sta
     html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto">
         <h2 style="color:#2A2A2A">Appointment Reminder</h2>
-        <p>Hi ${clientName},</p>
+        <p>Hi ${esc(clientName)},</p>
         <p>This is a reminder for your upcoming appointment:</p>
         <table style="width:100%;border-collapse:collapse">
           <tr>
             <td style="padding:8px 0;color:#888">Service</td>
-            <td style="padding:8px 0;font-weight:600">${serviceName}</td>
+            <td style="padding:8px 0;font-weight:600">${esc(serviceName)}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#888">Stylist</td>
-            <td style="padding:8px 0;font-weight:600">${staffName}</td>
+            <td style="padding:8px 0;font-weight:600">${esc(staffName)}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#888">Date &amp; Time</td>
@@ -82,15 +93,15 @@ export async function sendBookingConfirmation({
     html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto">
         <h2 style="color:#2A2A2A">Booking Confirmed!</h2>
-        <p>Hi ${clientName}, your appointment has been confirmed.</p>
+        <p>Hi ${esc(clientName)}, your appointment has been confirmed.</p>
         <table style="width:100%;border-collapse:collapse">
           <tr>
             <td style="padding:8px 0;color:#888">Service</td>
-            <td style="padding:8px 0;font-weight:600">${serviceName}</td>
+            <td style="padding:8px 0;font-weight:600">${esc(serviceName)}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#888">Stylist</td>
-            <td style="padding:8px 0;font-weight:600">${staffName}</td>
+            <td style="padding:8px 0;font-weight:600">${esc(staffName)}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#888">Date &amp; Time</td>

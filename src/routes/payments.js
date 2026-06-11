@@ -2,8 +2,7 @@ import { Router } from 'express';
 import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
-import { sendBookingConfirmation } from '../lib/email.js';
-import { resolveDiscount } from '../lib/discounts.js';
+import { resolveDiscountForServices } from '../lib/discounts.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -25,6 +24,7 @@ router.post('/create-intent', requireAuth, async (req, res) => {
     .eq('id', appointment_id)
     .single();
 
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
   if (apptError) return res.status(500).json({ error: apptError.message });
   if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
@@ -44,18 +44,43 @@ router.post('/create-intent', requireAuth, async (req, res) => {
   // deposit is a fixed up-front amount and is charged as-is — the discount
   // is reflected in total_cents (and therefore the remaining balance).
   let totalCents = appointment.total_cents;
-  if (discount_code && appointment.service) {
-    const result = await resolveDiscount(supabase, {
-      code: discount_code,
-      service: { price_cents: appointment.total_cents, category: appointment.service.category },
-    });
-    if (result.ok) {
-      totalCents = result.discounted_cents;
-      // Persist the discounted total so the balance owed stays correct.
-      await supabase
-        .from('appointments')
-        .update({ total_cents: totalCents })
-        .eq('id', appointment_id);
+  if (discount_code) {
+    // Recompute from the per-service price snapshot, NOT the stored
+    // total_cents — discounting the already-discounted total would let
+    // repeated calls stack the same code until the total hit zero.
+    const { data: itemRows } = await supabase
+      .from('appointment_services')
+      .select('price_cents, service:services(category)')
+      .eq('appointment_id', appointment_id);
+
+    let serviceSet = null;
+    if (itemRows && itemRows.length > 0) {
+      serviceSet = itemRows.map((r) => ({
+        price_cents: r.price_cents,
+        category: r.service?.category ?? null,
+      }));
+    } else if (appointment.service) {
+      // Legacy appointment with no appointment_services rows.
+      serviceSet = [{
+        price_cents: appointment.service.price_cents,
+        category: appointment.service.category,
+      }];
+    }
+
+    if (serviceSet) {
+      const result = await resolveDiscountForServices(supabase, {
+        code: discount_code,
+        services: serviceSet,
+      });
+      // Only persist if it improves on the current total (never raise it,
+      // never overwrite a better discount already applied at booking).
+      if (result.ok && result.discounted_cents < totalCents) {
+        totalCents = result.discounted_cents;
+        await supabase
+          .from('appointments')
+          .update({ total_cents: totalCents })
+          .eq('id', appointment_id);
+      }
     }
   }
 
@@ -126,99 +151,8 @@ router.post('/create-intent', requireAuth, async (req, res) => {
   }
 });
 
-// POST /webhook — Stripe webhook handler (raw body, no auth)
-// NOTE: This route must be mounted with express.raw() middleware — handled in index.js
-router.post('/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  if (!sig || !webhookSecret) {
-    return res.status(400).json({ error: 'Missing stripe signature or webhook secret' });
-  }
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-  } catch (err) {
-    console.error('Stripe webhook signature verification failed:', err.message);
-    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
-  }
-
-  switch (event.type) {
-    case 'payment_intent.succeeded': {
-      const paymentIntent = event.data.object;
-
-      // Find appointment by stripe_payment_intent_id
-      const { data: appointment, error: fetchError } = await supabase
-        .from('appointments')
-        .select('*, client:profiles!appointments_client_id_fkey(email, full_name), service:services(name), staff:profiles!appointments_staff_id_fkey(full_name)')
-        .eq('stripe_payment_intent_id', paymentIntent.id)
-        .single();
-
-      if (fetchError || !appointment) {
-        console.error('No appointment found for payment intent:', paymentIntent.id);
-        // Still return 200 to acknowledge receipt to Stripe
-        return res.json({ received: true });
-      }
-
-      // Update appointment: mark as confirmed and record payment
-      const { error: updateError } = await supabase
-        .from('appointments')
-        .update({
-          stripe_payment_status: 'succeeded',
-          status: 'confirmed',
-          amount_paid_cents: paymentIntent.amount_received,
-        })
-        .eq('id', appointment.id);
-
-      if (updateError) {
-        console.error('Failed to update appointment after payment success:', updateError.message);
-      }
-
-      // Send confirmation email
-      try {
-        if (appointment.client?.email) {
-          await sendBookingConfirmation({
-            to: appointment.client.email,
-            clientName: appointment.client.full_name,
-            serviceName: appointment.service?.name || 'Your service',
-            staffName: appointment.staff?.full_name || 'Your stylist',
-            startTime: appointment.start_time,
-            totalCents: appointment.total_cents,
-            depositCents: appointment.deposit_cents > 0 ? paymentIntent.amount_received : null,
-          });
-        }
-      } catch (emailError) {
-        console.error('Failed to send booking confirmation email after payment:', emailError.message);
-      }
-
-      break;
-    }
-
-    case 'payment_intent.payment_failed': {
-      const paymentIntent = event.data.object;
-
-      const { error: updateError } = await supabase
-        .from('appointments')
-        .update({
-          stripe_payment_status: 'failed',
-          status: 'pending',
-        })
-        .eq('stripe_payment_intent_id', paymentIntent.id);
-
-      if (updateError) {
-        console.error('Failed to update appointment after payment failure:', updateError.message);
-      }
-
-      break;
-    }
-
-    default:
-      // Acknowledge other event types without processing them
-      console.log(`Unhandled Stripe event type: ${event.type}`);
-  }
-
-  return res.json({ received: true });
-});
+// The Stripe webhook lives at /api/webhooks/stripe in index.js, mounted on
+// express.raw() BEFORE the JSON body parser. A handler here would receive a
+// parsed body and could never pass signature verification.
 
 export default router;
