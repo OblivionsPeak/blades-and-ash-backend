@@ -34,7 +34,9 @@ router.get('/:id/availability', async (req, res) => {
 // PUT /:id/availability — upsert weekly availability (own staff or admin)
 router.put('/:id/availability', requireAuth, async (req, res) => {
   const { id } = req.params;
-  const { slots } = req.body; // array of { day_of_week, start_time, end_time }
+  // Accept either a bare array body or { slots: [...] } — the admin UI posts
+  // the array directly.
+  const slots = Array.isArray(req.body) ? req.body : req.body.slots;
 
   // Check permissions: must be own profile or admin
   const userRole = req.user.profile.role;
