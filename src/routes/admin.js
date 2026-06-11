@@ -105,7 +105,7 @@ router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (r
       *,
       client:profiles!appointments_client_id_fkey(id, full_name, phone, avatar_url),
       staff:profiles!appointments_staff_id_fkey(id, full_name, avatar_url),
-      service:services(id, name, duration_minutes, price_cents)
+      service:services!appointments_service_id_fkey(id, name, duration_minutes, price_cents)
     `, { count: 'exact' })
     .order('start_time', { ascending: false })
     .range(off, off + lim - 1);

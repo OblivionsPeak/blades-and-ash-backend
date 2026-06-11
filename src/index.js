@@ -84,7 +84,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         .select(`
           *,
           client:profiles!appointments_client_id_fkey(id, full_name),
-          service:services(name),
+          service:services!appointments_service_id_fkey(name),
           staff:profiles!appointments_staff_id_fkey(full_name)
         `)
         .eq('stripe_payment_intent_id', paymentIntent.id)

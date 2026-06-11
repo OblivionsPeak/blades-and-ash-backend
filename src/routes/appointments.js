@@ -87,7 +87,7 @@ router.get('/', requireAuth, async (req, res) => {
       *,
       client:profiles!appointments_client_id_fkey(id, full_name, phone, avatar_url),
       staff:profiles!appointments_staff_id_fkey(id, full_name, avatar_url),
-      service:services(id, name, duration_minutes, price_cents)
+      service:services!appointments_service_id_fkey(id, name, duration_minutes, price_cents)
     `)
     .order('start_time', { ascending: false });
 
@@ -399,7 +399,7 @@ router.get('/:id', requireAuth, async (req, res) => {
       *,
       client:profiles!appointments_client_id_fkey(id, full_name, phone, avatar_url),
       staff:profiles!appointments_staff_id_fkey(id, full_name, avatar_url),
-      service:services(id, name, duration_minutes, price_cents)
+      service:services!appointments_service_id_fkey(id, name, duration_minutes, price_cents)
     `)
     .eq('id', id)
     .single();

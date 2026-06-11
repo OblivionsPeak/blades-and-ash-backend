@@ -20,7 +20,7 @@ router.post('/create-intent', requireAuth, async (req, res) => {
   // re-validate any promo code server-side — we never trust client amounts).
   const { data: appointment, error: apptError } = await supabase
     .from('appointments')
-    .select('*, service:services(name, price_cents, category)')
+    .select('*, service:services!appointments_service_id_fkey(name, price_cents, category)')
     .eq('id', appointment_id)
     .single();
 
