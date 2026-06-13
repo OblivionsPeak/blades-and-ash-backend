@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { DateTime } from 'luxon';
 import { supabase } from '../supabase.js';
+import { generateSlots } from '../lib/slots.js';
 
 const router = Router();
 
@@ -99,46 +100,17 @@ router.get('/', async (req, res) => {
     return res.status(500).json({ error: apptError.message });
   }
 
-  // 4. Generate 30-minute slots from the availability window. start_time and
-  // end_time are bare "HH:MM[:SS]" wall-clock times in SALON_TZ on this date.
-  const [startHour, startMin] = availability.start_time.split(':').map(Number);
-  const [endHour, endMin] = availability.end_time.split(':').map(Number);
-
-  // Availability window as salon-local wall-clock minutes from midnight.
-  const availStartMinutes = startHour * 60 + startMin;
-  const availEndMinutes = endHour * 60 + endMin;
-
-  const now = Date.now();
-  const slots = [];
-
-  // Step through in 30-min increments; the slot must end by the window close.
-  for (let slotStart = availStartMinutes; slotStart + durationMinutes <= availEndMinutes; slotStart += 30) {
-    const slotEnd = slotStart + durationMinutes;
-
-    // Build the slot's UTC instants from salon-local wall-clock minutes. Adding
-    // minutes to the salon-local midnight (in SALON_TZ) yields the correct UTC
-    // instant even across a DST boundary.
-    const slotStartDt = dayInSalonTz.plus({ minutes: slotStart });
-    const slotEndDt = dayInSalonTz.plus({ minutes: slotEnd });
-
-    const proposedStart = slotStartDt.toMillis();
-    const proposedEnd = slotEndDt.toMillis();
-
-    // 5. Check overlap with existing appointments.
-    const hasOverlap = (existingAppointments || []).some((appt) => {
-      const apptStart = new Date(appt.start_time).getTime();
-      const apptEnd = new Date(appt.end_time).getTime();
-      // Overlap: proposed starts before appt ends AND proposed ends after appt starts
-      return proposedStart < apptEnd && proposedEnd > apptStart;
-    });
-
-    if (!hasOverlap) {
-      // Skip slots in the past
-      if (proposedStart > now) {
-        slots.push(slotStartDt.toUTC().toISO());
-      }
-    }
-  }
+  // 4. Generate the free 30-minute slots (pure, DST-correct — see lib/slots.js).
+  // start_time/end_time are bare "HH:MM[:SS]" wall-clock times in SALON_TZ.
+  const slots = generateSlots({
+    date,
+    salonTz: SALON_TZ,
+    availStart: availability.start_time,
+    availEnd: availability.end_time,
+    durationMinutes,
+    existingAppointments: existingAppointments || [],
+    nowMs: Date.now(),
+  });
 
   return res.json(slots);
 });

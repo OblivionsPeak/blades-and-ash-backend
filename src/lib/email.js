@@ -13,7 +13,7 @@ const OWNER_EMAIL = process.env.OWNER_EMAIL || 'owner@bladeandash.com';
 
 // Guest-supplied values (names, etc.) end up in these templates — escape them
 // so a crafted booking can't inject HTML into mail sent from our domain.
-function esc(value) {
+export function esc(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')

@@ -1,11 +1,16 @@
 import { Router } from 'express';
 import Stripe from 'stripe';
+import { DateTime } from 'luxon';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Day/month boundaries are computed in the salon's timezone so "today" and
+// "this month" match the wall clock in Clarksville, not the UTC server clock.
+const SALON_TZ = process.env.SALON_TZ || 'America/Chicago';
 
 // Clamp user-supplied pagination to sane integers so `limit=abc` or a huge
 // offset can't produce a NaN range or dump the whole table.
@@ -18,11 +23,13 @@ function clampPagination(limit, offset, { maxLimit = 200 } = {}) {
 // GET /dashboard — dashboard stats (admin and staff)
 router.get('/dashboard', requireAuth, requireRole('admin', 'staff'), async (req, res) => {
   const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-  const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999).toISOString();
-
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999).toISOString();
+  // Anchor "today" and "this month" to salon-local wall-clock days, then
+  // convert the bounds to UTC ISO instants for the timestamptz comparisons.
+  const salonNow = DateTime.now().setZone(SALON_TZ);
+  const todayStart = salonNow.startOf('day').toUTC().toISO();
+  const todayEnd = salonNow.endOf('day').toUTC().toISO();
+  const monthStart = salonNow.startOf('month').toUTC().toISO();
+  const monthEnd = salonNow.endOf('month').toUTC().toISO();
 
   try {
     // Run queries in parallel
@@ -48,11 +55,15 @@ router.get('/dashboard', requireAuth, requireRole('admin', 'staff'), async (req,
         .lte('start_time', todayEnd)
         .neq('status', 'cancelled'),
 
-      // Revenue this month: sum of amount_paid_cents for confirmed/completed appointments
+      // Money actually collected this month: sum of amount_paid_cents across
+      // all appointments in the window. This captures deposits, full
+      // prepayments, in-person payments recorded at completion, and no-show
+      // fees uniformly — not just online-paid bookings. Cancelled appointments
+      // are excluded (a refunded/abandoned deposit shouldn't read as revenue).
       supabase
         .from('appointments')
         .select('amount_paid_cents')
-        .in('status', ['confirmed', 'completed'])
+        .neq('status', 'cancelled')
         .gte('start_time', monthStart)
         .lte('start_time', monthEnd),
 

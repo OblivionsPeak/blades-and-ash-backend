@@ -31,7 +31,7 @@ async function processReminders() {
           guest_name,
           guest_email,
           guest_phone,
-          client:profiles!appointments_client_id_fkey(id, full_name, phone, email:id),
+          client:profiles!appointments_client_id_fkey(id, full_name, phone),
           staff:profiles!appointments_staff_id_fkey(id, full_name),
           service:services!appointments_service_id_fkey(id, name)
         )

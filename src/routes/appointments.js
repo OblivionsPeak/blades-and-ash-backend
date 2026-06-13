@@ -5,6 +5,7 @@ import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from '../lib/email.js';
 import { resolveDiscountForServices } from '../lib/discounts.js';
+import { computeFee, isValidFeeType } from '../lib/fees.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -497,12 +498,16 @@ router.get('/:id', requireAuth, async (req, res) => {
 // PUT /:id — update appointment (staff/admin)
 router.put('/:id', requireAuth, requireRole('staff', 'admin'), async (req, res) => {
   const { id } = req.params;
-  const { status, notes, start_time, end_time } = req.body;
+  const { status, notes, start_time, end_time, amount_paid_cents } = req.body;
 
   const validStatuses = ['pending', 'confirmed', 'cancelled', 'completed', 'no_show'];
 
   if (status && !validStatuses.includes(status)) {
     return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+  if (amount_paid_cents !== undefined
+      && (typeof amount_paid_cents !== 'number' || amount_paid_cents < 0 || !Number.isFinite(amount_paid_cents))) {
+    return res.status(400).json({ error: 'amount_paid_cents must be a non-negative number' });
   }
 
   const updates = {};
@@ -510,6 +515,24 @@ router.put('/:id', requireAuth, requireRole('staff', 'admin'), async (req, res) 
   if (notes !== undefined) updates.notes = notes;
   if (start_time !== undefined) updates.start_time = start_time;
   if (end_time !== undefined) updates.end_time = end_time;
+  if (amount_paid_cents !== undefined) updates.amount_paid_cents = Math.round(amount_paid_cents);
+
+  // Recording revenue: most services are settled in person, so marking an
+  // appointment completed should record that the service total was collected
+  // (unless an explicit amount was given, or more was already paid online).
+  // Without this the revenue dashboard only ever sees online deposits.
+  if (status === 'completed' && amount_paid_cents === undefined) {
+    const { data: current, error: fetchErr } = await supabase
+      .from('appointments')
+      .select('total_cents, amount_paid_cents')
+      .eq('id', id)
+      .single();
+    if (fetchErr && fetchErr.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+    if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+    if ((current.amount_paid_cents || 0) < current.total_cents) {
+      updates.amount_paid_cents = current.total_cents;
+    }
+  }
 
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No fields provided to update' });
@@ -566,6 +589,191 @@ router.delete('/:id', requireAuth, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ message: 'Appointment cancelled', appointment: data });
+});
+
+// POST /:id/charge-fee — charge a no-show / late-cancellation fee to the
+// client's saved card (admin only). The fee policy lives in lib/fees.js;
+// already-collected payments (deposits) reduce what's charged now.
+router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { fee_type, amount_cents } = req.body;
+
+  if (!isValidFeeType(fee_type)) {
+    return res.status(400).json({ error: "fee_type must be 'no_show' or 'late_cancel'" });
+  }
+  if (amount_cents !== undefined
+      && (typeof amount_cents !== 'number' || amount_cents <= 0 || !Number.isFinite(amount_cents))) {
+    return res.status(400).json({ error: 'amount_cents, if provided, must be a positive number' });
+  }
+
+  const { data: appointment, error: apptError } = await supabase
+    .from('appointments')
+    .select('id, client_id, total_cents, amount_paid_cents, fee_charged_cents')
+    .eq('id', id)
+    .single();
+
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (apptError) return res.status(500).json({ error: apptError.message });
+
+  if (!appointment.client_id) {
+    return res.status(400).json({ error: 'This is a guest booking with no account, so there is no card on file to charge.' });
+  }
+
+  const { feeCents, chargeableCents } = computeFee({
+    feeType: fee_type,
+    totalCents: appointment.total_cents,
+    amountPaidCents: appointment.amount_paid_cents,
+    overrideCents: amount_cents,
+  });
+
+  if (chargeableCents <= 0) {
+    return res.json({
+      charged: false,
+      message: 'Payments already collected cover this fee — nothing to charge.',
+      fee_cents: feeCents,
+    });
+  }
+
+  // Need a Stripe customer with a saved card.
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('stripe_customer_id')
+    .eq('id', appointment.client_id)
+    .single();
+  if (profileError) return res.status(500).json({ error: profileError.message });
+  if (!profile.stripe_customer_id) {
+    return res.status(400).json({ error: 'No card on file for this client. Save a card first (Clients tab).' });
+  }
+
+  let paymentIntent;
+  try {
+    const methods = await stripe.paymentMethods.list({ customer: profile.stripe_customer_id, type: 'card' });
+    if (!methods.data.length) {
+      return res.status(400).json({ error: 'No card on file for this client. Save a card first (Clients tab).' });
+    }
+
+    paymentIntent = await stripe.paymentIntents.create({
+      amount: chargeableCents,
+      currency: 'usd',
+      customer: profile.stripe_customer_id,
+      payment_method: methods.data[0].id,
+      off_session: true,
+      confirm: true,
+      metadata: { appointment_id: id, fee_type, kind: 'fee' },
+    });
+  } catch (stripeError) {
+    // off_session charges can fail if the card needs authentication or is
+    // declined — surface a clear, actionable message to the admin.
+    const code = stripeError.code || stripeError.raw?.code;
+    if (code === 'authentication_required') {
+      return res.status(402).json({ error: 'The card on file requires authentication and could not be charged off-session. Ask the client to pay this fee directly.' });
+    }
+    return res.status(402).json({ error: `Card could not be charged: ${stripeError.message}` });
+  }
+
+  if (paymentIntent.status !== 'succeeded') {
+    return res.status(402).json({ error: `Charge did not complete (status: ${paymentIntent.status}).` });
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('appointments')
+    .update({
+      fee_type,
+      fee_charged_cents: (appointment.fee_charged_cents || 0) + chargeableCents,
+      fee_payment_intent_id: paymentIntent.id,
+      amount_paid_cents: (appointment.amount_paid_cents || 0) + chargeableCents,
+    })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  return res.json({ charged: true, amount_cents: chargeableCents, fee_cents: feeCents, appointment: updated });
+});
+
+// PUT /:id/reschedule — move an appointment to a new start time. A client may
+// reschedule their own booking; staff/admin may reschedule any. Duration and
+// services are preserved (the new end is derived from the existing length).
+router.put('/:id/reschedule', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { start_time } = req.body;
+  const userRole = req.user.profile.role;
+  const userId = req.user.id;
+
+  if (!start_time) {
+    return res.status(400).json({ error: 'start_time is required' });
+  }
+  const newStart = new Date(start_time);
+  if (isNaN(newStart.getTime())) {
+    return res.status(400).json({ error: 'Invalid start_time format' });
+  }
+  if (newStart.getTime() <= Date.now()) {
+    return res.status(400).json({ error: 'start_time must be in the future' });
+  }
+
+  const { data: appointment, error: fetchError } = await supabase
+    .from('appointments')
+    .select('id, client_id, staff_id, status, start_time, end_time')
+    .eq('id', id)
+    .single();
+
+  if (fetchError && fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+
+  const isOwner = appointment.client_id === userId;
+  const isStaffOrAdmin = userRole === 'staff' || userRole === 'admin';
+  if (!isOwner && !isStaffOrAdmin) {
+    return res.status(403).json({ error: 'You are not authorized to reschedule this appointment' });
+  }
+  if (['cancelled', 'completed', 'no_show'].includes(appointment.status)) {
+    return res.status(400).json({ error: `A ${appointment.status.replace('_', ' ')} appointment cannot be rescheduled.` });
+  }
+
+  // Preserve the booked duration — the services don't change on reschedule.
+  const durationMs = new Date(appointment.end_time).getTime() - new Date(appointment.start_time).getTime();
+  const newEnd = new Date(newStart.getTime() + durationMs);
+  const newStartIso = newStart.toISOString();
+  const newEndIso = newEnd.toISOString();
+
+  // Conflict check against the same staff, excluding this appointment.
+  const { data: conflicts, error: conflictError } = await supabase
+    .from('appointments')
+    .select('id')
+    .eq('staff_id', appointment.staff_id)
+    .neq('id', id)
+    .neq('status', 'cancelled')
+    .lt('start_time', newEndIso)
+    .gt('end_time', newStartIso);
+
+  if (conflictError) return res.status(500).json({ error: conflictError.message });
+  if (conflicts && conflicts.length > 0) {
+    return res.status(409).json({ error: 'That time is no longer available. Please choose a different time.' });
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('appointments')
+    .update({ start_time: newStartIso, end_time: newEndIso })
+    .eq('id', id)
+    .select()
+    .single();
+
+  // 23P01 = exclusion_violation: the DB overlap constraint caught a race.
+  if (updateError && updateError.code === '23P01') {
+    return res.status(409).json({ error: 'That time is no longer available. Please choose a different time.' });
+  }
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // Reset reminders so the 24h/2h notices fire relative to the new time.
+  await supabase.from('reminders').delete().eq('appointment_id', id).eq('status', 'pending');
+  await supabase.from('reminders').insert([
+    { appointment_id: id, type: '24h', channel: 'email', status: 'pending' },
+    { appointment_id: id, type: '24h', channel: 'sms', status: 'pending' },
+    { appointment_id: id, type: '2h', channel: 'email', status: 'pending' },
+    { appointment_id: id, type: '2h', channel: 'sms', status: 'pending' },
+  ]);
+
+  return res.json({ message: 'Appointment rescheduled', appointment: updated });
 });
 
 export default router;
