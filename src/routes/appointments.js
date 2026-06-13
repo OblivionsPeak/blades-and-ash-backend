@@ -3,7 +3,7 @@ import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
-import { sendBookingConfirmation } from '../lib/email.js';
+import { sendBookingConfirmation, sendOwnerBookingAlert } from '../lib/email.js';
 import { resolveDiscountForServices } from '../lib/discounts.js';
 
 const router = Router();
@@ -138,7 +138,7 @@ router.get('/', requireAuth, async (req, res) => {
 router.post('/', optionalAuth, async (req, res) => {
   const {
     staff_id, service_id, service_ids, start_time, client_notes, discount_code,
-    guest_name, guest_email, guest_phone, client_id,
+    guest_name, guest_email, guest_phone, client_id, pay_in_full,
   } = req.body;
 
   const isGuest = !req.user;
@@ -276,10 +276,23 @@ router.post('/', optionalAuth, async (req, res) => {
     (sum, s) => sum + (s.deposit_required && s.deposit_cents > 0 ? s.deposit_cents : 0),
     0,
   );
-  // Admin (walk-in/phone) bookings skip the online deposit — payment is
-  // settled at the salon — so the appointment is confirmed immediately.
+  // Admin (walk-in/phone) bookings skip online payment — settled at the salon —
+  // so the appointment is confirmed immediately.
   const depositRequired = depositSum > 0 && !isAdminBooking;
   const depositCents = depositRequired ? Math.min(depositSum, totalCents) : 0;
+
+  // The client may opt to pay the whole service up front instead of just the
+  // deposit. We never trust a client-sent amount: pay_in_full is a boolean and
+  // the charged amount is always the server-computed total. Admin bookings
+  // (settled in person) ignore it.
+  const payInFull = !!pay_in_full && !isAdminBooking && totalCents > 0;
+
+  // Amount to collect online now: the full total when paying in full, otherwise
+  // the deposit (if any). Zero means nothing is due online and the appointment
+  // confirms immediately.
+  const chargeCents = payInFull ? totalCents : depositCents;
+  const paymentRequired = chargeCents > 0;
+  const paymentType = payInFull ? 'full' : 'deposit';
 
   // Create appointment. service_id is the FIRST/primary service so existing
   // single-service joins keep working; the full set is stored in
@@ -290,7 +303,7 @@ router.post('/', optionalAuth, async (req, res) => {
     service_id: primaryService.id,
     start_time,
     end_time,
-    status: depositRequired ? 'pending' : 'confirmed',
+    status: paymentRequired ? 'pending' : 'confirmed',
     client_notes: client_notes || null,
     total_cents: totalCents,
     deposit_cents: depositCents,
@@ -303,11 +316,12 @@ router.post('/', optionalAuth, async (req, res) => {
 
   let stripePaymentIntent = null;
 
-  // If deposit required, create Stripe PaymentIntent first
-  if (depositRequired) {
+  // If a payment is due online (deposit or pay-in-full), create the Stripe
+  // PaymentIntent first.
+  if (paymentRequired) {
     try {
       stripePaymentIntent = await stripe.paymentIntents.create({
-        amount: depositCents,
+        amount: chargeCents,
         currency: 'usd',
         metadata: {
           // Stripe metadata values must be strings; use '' for guest bookings.
@@ -316,6 +330,9 @@ router.post('/', optionalAuth, async (req, res) => {
           service_id: primaryService.id,
           service_name: primaryService.name,
           guest_email: guestEmail || '',
+          // 'full' => whole service prepaid; 'deposit' => deposit only. The
+          // webhook uses this to label the confirmation correctly.
+          payment_type: paymentType,
         },
         automatic_payment_methods: { enabled: true },
       });
@@ -378,8 +395,10 @@ router.post('/', optionalAuth, async (req, res) => {
 
   await supabase.from('reminders').insert(reminderRows);
 
-  // Send booking confirmation email if status is confirmed (no deposit required)
-  if (!depositRequired) {
+  // When nothing is due online the booking is already confirmed, so notify
+  // both the client and the owner now. Payment-required bookings instead fire
+  // these from the Stripe webhook once the charge succeeds.
+  if (!paymentRequired) {
     try {
       const { data: staffProfile } = await supabase
         .from('profiles')
@@ -390,22 +409,37 @@ router.post('/', optionalAuth, async (req, res) => {
       const serviceName = services.length > 1
         ? `${primaryService.name} and ${services.length - 1} more`
         : primaryService.name;
-
+      const staffName = staffProfile?.full_name || 'Your stylist';
+      const clientDisplayName = isGuest ? guestName : (bookedForName || 'there');
       const confirmTo = isGuest ? guestEmail : bookedForEmail;
+
       if (confirmTo) {
         await sendBookingConfirmation({
           to: confirmTo,
-          clientName: isGuest ? guestName : (bookedForName || 'there'),
+          clientName: clientDisplayName,
           serviceName,
-          staffName: staffProfile?.full_name || 'Your stylist',
+          staffName,
           startTime: start_time,
           totalCents,
-          depositCents: null,
+          amountPaidCents: null,
         });
       }
+
+      await sendOwnerBookingAlert({
+        clientName: clientDisplayName,
+        clientEmail: confirmTo,
+        clientPhone: isGuest ? guestPhone : null,
+        serviceName,
+        staffName,
+        startTime: start_time,
+        totalCents,
+        amountPaidCents: null,
+        notes: client_notes || null,
+        isGuest,
+      });
     } catch (emailError) {
       // Non-fatal: log but don't fail the request
-      console.error('Failed to send confirmation email:', emailError.message);
+      console.error('Failed to send booking notification:', emailError.message);
     }
   }
 

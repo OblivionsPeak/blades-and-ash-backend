@@ -13,7 +13,7 @@ import discountsRouter from './routes/discounts.js';
 import adminRouter from './routes/admin.js';
 import { startReminderJob } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
-import { sendBookingConfirmation } from './lib/email.js';
+import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -83,7 +83,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         .from('appointments')
         .select(`
           *,
-          client:profiles!appointments_client_id_fkey(id, full_name),
+          client:profiles!appointments_client_id_fkey(id, full_name, phone),
           service:services!appointments_service_id_fkey(name),
           staff:profiles!appointments_staff_id_fkey(full_name)
         `)
@@ -104,34 +104,59 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         })
         .eq('id', appointment.id);
 
-      // Send confirmation email. Signed-in clients are looked up in auth.users;
+      // Notify client + owner. Signed-in clients are looked up in auth.users;
       // guest bookings (client_id null) use the stored guest_email/guest_name.
       try {
         let to = null;
         let clientName = 'Valued Client';
+        let clientPhone = null;
 
         if (appointment.client_id) {
           const { data: userData } = await supabase.auth.admin.getUserById(appointment.client_id);
           to = userData?.user?.email || null;
           clientName = appointment.client?.full_name || 'Valued Client';
+          clientPhone = appointment.client?.phone || null;
         } else {
           to = appointment.guest_email || null;
           clientName = appointment.guest_name || 'Valued Client';
+          clientPhone = appointment.guest_phone || null;
         }
+
+        // metadata.payment_type tells whether this was a deposit or a full
+        // prepayment, so both emails label the amount correctly.
+        const paidInFull = paymentIntent.metadata?.payment_type === 'full';
+        const paymentLabel = paidInFull ? 'Paid in full' : 'Deposit paid';
+        const serviceName = appointment.service?.name || 'Your service';
+        const staffName = appointment.staff?.full_name || 'Your stylist';
 
         if (to) {
           await sendBookingConfirmation({
             to,
             clientName,
-            serviceName: appointment.service?.name || 'Your service',
-            staffName: appointment.staff?.full_name || 'Your stylist',
+            serviceName,
+            staffName,
             startTime: appointment.start_time,
             totalCents: appointment.total_cents,
-            depositCents: appointment.deposit_cents > 0 ? paymentIntent.amount_received : null,
+            amountPaidCents: paymentIntent.amount_received,
+            paymentLabel,
           });
         }
+
+        await sendOwnerBookingAlert({
+          clientName,
+          clientEmail: to,
+          clientPhone,
+          serviceName,
+          staffName,
+          startTime: appointment.start_time,
+          totalCents: appointment.total_cents,
+          amountPaidCents: paymentIntent.amount_received,
+          paymentLabel,
+          notes: appointment.client_notes || null,
+          isGuest: !appointment.client_id,
+        });
       } catch (emailError) {
-        console.error('Failed to send confirmation email after payment:', emailError.message);
+        console.error('Failed to send booking notifications after payment:', emailError.message);
       }
 
       break;

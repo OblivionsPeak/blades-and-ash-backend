@@ -8,6 +8,9 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 // verification in Resend for delivery — that's a separate human step).
 const FROM_ADDRESS = process.env.RESEND_FROM || 'Blades & Ash <bookings@bladeandash.com>';
 
+// Where new-booking alerts go. Defaults to the salon owner; override per-deploy.
+const OWNER_EMAIL = process.env.OWNER_EMAIL || 'owner@bladeandash.com';
+
 // Guest-supplied values (names, etc.) end up in these templates — escape them
 // so a crafted booking can't inject HTML into mail sent from our domain.
 function esc(value) {
@@ -72,7 +75,10 @@ export async function sendBookingConfirmation({
   staffName,
   startTime,
   totalCents,
-  depositCents,
+  // Amount the client paid online (deposit or full). When > 0, paymentLabel
+  // names what it was ('Deposit paid' / 'Paid in full'). null/0 => pay-at-salon.
+  amountPaidCents = null,
+  paymentLabel = 'Deposit paid',
 }) {
   const dateStr = new Date(startTime).toLocaleString('en-US', {
     weekday: 'long',
@@ -84,7 +90,7 @@ export async function sendBookingConfirmation({
   });
 
   const total = (totalCents / 100).toFixed(2);
-  const deposit = depositCents ? (depositCents / 100).toFixed(2) : null;
+  const paid = amountPaidCents ? (amountPaidCents / 100).toFixed(2) : null;
 
   const { data, error } = await resend.emails.send({
     from: FROM_ADDRESS,
@@ -112,10 +118,10 @@ export async function sendBookingConfirmation({
             <td style="padding:8px 0;font-weight:600">$${total}</td>
           </tr>
           ${
-            deposit
+            paid
               ? `<tr>
-            <td style="padding:8px 0;color:#888">Deposit paid</td>
-            <td style="padding:8px 0;font-weight:600">$${deposit}</td>
+            <td style="padding:8px 0;color:#888">${esc(paymentLabel)}</td>
+            <td style="padding:8px 0;font-weight:600">$${paid}</td>
           </tr>`
               : ''
           }
@@ -133,6 +139,76 @@ export async function sendBookingConfirmation({
 
   if (error) {
     throw new Error(`Failed to send confirmation email: ${error.message}`);
+  }
+
+  return data;
+}
+
+// Notifies the salon owner that a booking is now secured. Fired from the same
+// points as the client confirmation: the instant-confirm path (no payment due)
+// and the Stripe webhook (after a deposit / full payment succeeds). Client-
+// supplied values are escaped — they render in mail sent from our domain.
+export async function sendOwnerBookingAlert({
+  clientName,
+  clientEmail,
+  clientPhone,
+  serviceName,
+  staffName,
+  startTime,
+  totalCents,
+  amountPaidCents = null,
+  paymentLabel = 'Deposit paid',
+  notes,
+  isGuest = false,
+}) {
+  const dateStr = new Date(startTime).toLocaleString('en-US', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  });
+
+  const total = (totalCents / 100).toFixed(2);
+  const paid = amountPaidCents ? (amountPaidCents / 100).toFixed(2) : null;
+  const payStatus = paid ? `${paymentLabel} — $${paid}` : 'Nothing collected online (pay at salon)';
+
+  function row(label, value) {
+    return `<tr>
+            <td style="padding:8px 0;color:#888">${esc(label)}</td>
+            <td style="padding:8px 0;font-weight:600">${value}</td>
+          </tr>`;
+  }
+
+  const { data, error } = await resend.emails.send({
+    from: FROM_ADDRESS,
+    to: OWNER_EMAIL,
+    // Reply lands in the client's inbox so Holly can respond in one tap.
+    reply_to: clientEmail || undefined,
+    subject: `New booking: ${esc(clientName)} — ${dateStr}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto">
+        <h2 style="color:#2A2A2A">New Booking</h2>
+        <p>${esc(clientName)}${isGuest ? ' (guest)' : ''} just booked an appointment.</p>
+        <table style="width:100%;border-collapse:collapse">
+          ${row('Client', esc(clientName))}
+          ${clientEmail ? row('Email', esc(clientEmail)) : ''}
+          ${clientPhone ? row('Phone', esc(clientPhone)) : ''}
+          ${row('Service', esc(serviceName))}
+          ${row('Stylist', esc(staffName))}
+          ${row('Date &amp; Time', dateStr)}
+          ${row('Total', `$${total}`)}
+          ${row('Payment', esc(payStatus))}
+          ${notes ? row('Notes', esc(notes)) : ''}
+        </table>
+        <p style="color:#C4A882;font-weight:600;margin-top:24px">Blades &amp; Ash Studio</p>
+      </div>
+    `,
+  });
+
+  if (error) {
+    throw new Error(`Failed to send owner booking alert: ${error.message}`);
   }
 
   return data;
