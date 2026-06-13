@@ -139,7 +139,7 @@ router.get('/', requireAuth, async (req, res) => {
 router.post('/', optionalAuth, async (req, res) => {
   const {
     staff_id, service_id, service_ids, start_time, client_notes, discount_code,
-    guest_name, guest_email, guest_phone, client_id, pay_in_full,
+    guest_name, guest_email, guest_phone, client_id,
   } = req.body;
 
   const isGuest = !req.user;
@@ -282,18 +282,12 @@ router.post('/', optionalAuth, async (req, res) => {
   const depositRequired = depositSum > 0 && !isAdminBooking;
   const depositCents = depositRequired ? Math.min(depositSum, totalCents) : 0;
 
-  // The client may opt to pay the whole service up front instead of just the
-  // deposit. We never trust a client-sent amount: pay_in_full is a boolean and
-  // the charged amount is always the server-computed total. Admin bookings
-  // (settled in person) ignore it.
-  const payInFull = !!pay_in_full && !isAdminBooking && totalCents > 0;
-
-  // Amount to collect online now: the full total when paying in full, otherwise
-  // the deposit (if any). Zero means nothing is due online and the appointment
-  // confirms immediately.
-  const chargeCents = payInFull ? totalCents : depositCents;
+  // Pay-in-full was removed at the salon's request — collecting the full service
+  // amount up front creates refund/chargeback exposure on cancellations and
+  // no-shows. Online payment is the deposit only; the balance is settled in
+  // person. (pay_in_full from the client is intentionally ignored.)
+  const chargeCents = depositCents;
   const paymentRequired = chargeCents > 0;
-  const paymentType = payInFull ? 'full' : 'deposit';
 
   // Create appointment. service_id is the FIRST/primary service so existing
   // single-service joins keep working; the full set is stored in
@@ -331,9 +325,7 @@ router.post('/', optionalAuth, async (req, res) => {
           service_id: primaryService.id,
           service_name: primaryService.name,
           guest_email: guestEmail || '',
-          // 'full' => whole service prepaid; 'deposit' => deposit only. The
-          // webhook uses this to label the confirmation correctly.
-          payment_type: paymentType,
+          payment_type: 'deposit',
         },
         automatic_payment_methods: { enabled: true },
       });
