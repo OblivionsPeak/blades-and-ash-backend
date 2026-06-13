@@ -273,21 +273,11 @@ router.post('/', optionalAuth, async (req, res) => {
     }
   }
 
-  const depositSum = services.reduce(
-    (sum, s) => sum + (s.deposit_required && s.deposit_cents > 0 ? s.deposit_cents : 0),
-    0,
-  );
-  // Admin (walk-in/phone) bookings skip online payment — settled at the salon —
-  // so the appointment is confirmed immediately.
-  const depositRequired = depositSum > 0 && !isAdminBooking;
-  const depositCents = depositRequired ? Math.min(depositSum, totalCents) : 0;
-
-  // Pay-in-full was removed at the salon's request — collecting the full service
-  // amount up front creates refund/chargeback exposure on cancellations and
-  // no-shows. Online payment is the deposit only; the balance is settled in
-  // person. (pay_in_full from the client is intentionally ignored.)
-  const chargeCents = depositCents;
-  const paymentRequired = chargeCents > 0;
+  // Card-on-file replaces deposits: nothing is charged at booking. Public
+  // (self-service) bookings MUST save a card via a Stripe SetupIntent so a
+  // no-show / late-cancel fee can be charged later. Admin walk-in/phone
+  // bookings are settled in person and skip card capture.
+  const cardRequired = !isAdminBooking;
 
   // Create appointment. service_id is the FIRST/primary service so existing
   // single-service joins keep working; the full set is stored in
@@ -298,10 +288,10 @@ router.post('/', optionalAuth, async (req, res) => {
     service_id: primaryService.id,
     start_time,
     end_time,
-    status: paymentRequired ? 'pending' : 'confirmed',
+    status: cardRequired ? 'pending' : 'confirmed',
     client_notes: client_notes || null,
     total_cents: totalCents,
-    deposit_cents: depositCents,
+    deposit_cents: 0,
     amount_paid_cents: 0,
     // Guest contact details (null for signed-in clients).
     guest_name: guestName,
@@ -309,31 +299,49 @@ router.post('/', optionalAuth, async (req, res) => {
     guest_phone: guestPhone,
   };
 
-  let stripePaymentIntent = null;
-
-  // If a payment is due online (deposit or pay-in-full), create the Stripe
-  // PaymentIntent first.
-  if (paymentRequired) {
+  // Set up the Stripe customer + SetupIntent that captures the card on file.
+  let setupIntent = null;
+  if (cardRequired) {
     try {
-      stripePaymentIntent = await stripe.paymentIntents.create({
-        amount: chargeCents,
-        currency: 'usd',
-        metadata: {
-          // Stripe metadata values must be strings; use '' for guest bookings.
-          client_id: clientId || '',
-          staff_id,
-          service_id: primaryService.id,
-          service_name: primaryService.name,
-          guest_email: guestEmail || '',
-          payment_type: 'deposit',
-        },
-        automatic_payment_methods: { enabled: true },
+      let customerId = null;
+      if (isGuest) {
+        const customer = await stripe.customers.create({
+          name: guestName || undefined,
+          email: guestEmail || undefined,
+          metadata: { guest: 'true' },
+        });
+        customerId = customer.id;
+      } else {
+        // Account holder: reuse the profile's Stripe customer, creating one the
+        // first time they book.
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('stripe_customer_id')
+          .eq('id', clientId)
+          .single();
+        customerId = profile?.stripe_customer_id || null;
+        if (!customerId) {
+          const customer = await stripe.customers.create({
+            name: bookedForName || undefined,
+            email: bookedForEmail || undefined,
+            metadata: { profile_id: clientId },
+          });
+          customerId = customer.id;
+          await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', clientId);
+        }
+      }
+
+      setupIntent = await stripe.setupIntents.create({
+        customer: customerId,
+        usage: 'off_session',
+        payment_method_types: ['card'],
+        metadata: { service_name: primaryService.name },
       });
 
-      appointmentData.stripe_payment_intent_id = stripePaymentIntent.id;
-      appointmentData.stripe_payment_status = 'requires_payment_method';
+      appointmentData.stripe_customer_id = customerId;
+      appointmentData.stripe_setup_intent_id = setupIntent.id;
     } catch (stripeError) {
-      return res.status(500).json({ error: `Payment setup failed: ${stripeError.message}` });
+      return res.status(500).json({ error: `Card setup failed: ${stripeError.message}` });
     }
   }
 
@@ -344,9 +352,9 @@ router.post('/', optionalAuth, async (req, res) => {
     .single();
 
   if (insertError) {
-    // If appointment creation fails and we already made a PaymentIntent, cancel it
-    if (stripePaymentIntent) {
-      await stripe.paymentIntents.cancel(stripePaymentIntent.id).catch(() => {});
+    // If appointment creation fails and we already made a SetupIntent, cancel it.
+    if (setupIntent) {
+      await stripe.setupIntents.cancel(setupIntent.id).catch(() => {});
     }
     // 23P01 = exclusion_violation: the DB overlap constraint caught a booking
     // race that slipped past the pre-check above.
@@ -369,11 +377,11 @@ router.post('/', optionalAuth, async (req, res) => {
     .insert(itemRows);
 
   if (itemsError) {
-    // Roll back the appointment (and any PaymentIntent) so we never leave an
+    // Roll back the appointment (and any SetupIntent) so we never leave an
     // appointment without its service line items.
     await supabase.from('appointments').delete().eq('id', appointment.id);
-    if (stripePaymentIntent) {
-      await stripe.paymentIntents.cancel(stripePaymentIntent.id).catch(() => {});
+    if (setupIntent) {
+      await stripe.setupIntents.cancel(setupIntent.id).catch(() => {});
     }
     return res.status(500).json({ error: itemsError.message });
   }
@@ -388,10 +396,10 @@ router.post('/', optionalAuth, async (req, res) => {
 
   await supabase.from('reminders').insert(reminderRows);
 
-  // When nothing is due online the booking is already confirmed, so notify
-  // both the client and the owner now. Payment-required bookings instead fire
-  // these from the Stripe webhook once the charge succeeds.
-  if (!paymentRequired) {
+  // Admin (in-person) bookings have no card step and are confirmed immediately,
+  // so notify the client and owner now. Card-required bookings instead fire
+  // these from the Stripe webhook once the card is saved (setup_intent.succeeded).
+  if (!cardRequired) {
     try {
       const { data: staffProfile } = await supabase
         .from('profiles')
@@ -437,8 +445,8 @@ router.post('/', optionalAuth, async (req, res) => {
   }
 
   const response = { appointment };
-  if (stripePaymentIntent) {
-    response.client_secret = stripePaymentIntent.client_secret;
+  if (setupIntent) {
+    response.setup_client_secret = setupIntent.client_secret;
   }
 
   return res.status(201).json(response);
@@ -600,16 +608,12 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
 
   const { data: appointment, error: apptError } = await supabase
     .from('appointments')
-    .select('id, client_id, total_cents, amount_paid_cents, fee_charged_cents')
+    .select('id, client_id, total_cents, amount_paid_cents, fee_charged_cents, stripe_customer_id')
     .eq('id', id)
     .single();
 
   if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
   if (apptError) return res.status(500).json({ error: apptError.message });
-
-  if (!appointment.client_id) {
-    return res.status(400).json({ error: 'This is a guest booking with no account, so there is no card on file to charge.' });
-  }
 
   const { feeCents, chargeableCents } = computeFee({
     feeType: fee_type,
@@ -626,28 +630,34 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
     });
   }
 
-  // Need a Stripe customer with a saved card.
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('stripe_customer_id')
-    .eq('id', appointment.client_id)
-    .single();
-  if (profileError) return res.status(500).json({ error: profileError.message });
-  if (!profile.stripe_customer_id) {
-    return res.status(400).json({ error: 'No card on file for this client. Save a card first (Clients tab).' });
+  // Resolve the Stripe customer holding the saved card. New bookings store it
+  // on the appointment (so guests work too); fall back to the account profile
+  // for older bookings or admin-saved cards.
+  let customerId = appointment.stripe_customer_id || null;
+  if (!customerId && appointment.client_id) {
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id')
+      .eq('id', appointment.client_id)
+      .single();
+    if (profileError) return res.status(500).json({ error: profileError.message });
+    customerId = profile?.stripe_customer_id || null;
+  }
+  if (!customerId) {
+    return res.status(400).json({ error: 'No card on file for this appointment.' });
   }
 
   let paymentIntent;
   try {
-    const methods = await stripe.paymentMethods.list({ customer: profile.stripe_customer_id, type: 'card' });
+    const methods = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
     if (!methods.data.length) {
-      return res.status(400).json({ error: 'No card on file for this client. Save a card first (Clients tab).' });
+      return res.status(400).json({ error: 'No card on file for this appointment.' });
     }
 
     paymentIntent = await stripe.paymentIntents.create({
       amount: chargeableCents,
       currency: 'usd',
-      customer: profile.stripe_customer_id,
+      customer: customerId,
       payment_method: methods.data[0].id,
       off_session: true,
       confirm: true,

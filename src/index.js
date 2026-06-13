@@ -79,6 +79,10 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
     case 'payment_intent.succeeded': {
       const paymentIntent = event.data.object;
 
+      // No-show / late-cancel fees are charged and reconciled synchronously in
+      // the charge-fee endpoint, so ignore them here.
+      if (paymentIntent.metadata?.kind === 'fee') break;
+
       const { data: appointment, error: fetchError } = await supabase
         .from('appointments')
         .select(`
@@ -165,6 +169,8 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
     case 'payment_intent.payment_failed': {
       const paymentIntent = event.data.object;
 
+      if (paymentIntent.metadata?.kind === 'fee') break;
+
       await supabase
         .from('appointments')
         .update({
@@ -172,6 +178,88 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
           status: 'pending',
         })
         .eq('stripe_payment_intent_id', paymentIntent.id);
+
+      break;
+    }
+
+    // A card was saved on file at booking — confirm the appointment and notify.
+    // No money is charged; the card is only used later for no-show/late-cancel
+    // fees. This is the booking-confirmation path now that deposits are gone.
+    case 'setup_intent.succeeded': {
+      const setupIntent = event.data.object;
+
+      const { data: appointment, error: fetchError } = await supabase
+        .from('appointments')
+        .select(`
+          *,
+          client:profiles!appointments_client_id_fkey(id, full_name, phone),
+          service:services!appointments_service_id_fkey(name),
+          staff:profiles!appointments_staff_id_fkey(full_name)
+        `)
+        .eq('stripe_setup_intent_id', setupIntent.id)
+        .single();
+
+      if (fetchError || !appointment) {
+        console.error('No appointment found for setup intent:', setupIntent.id);
+        return res.json({ received: true });
+      }
+
+      // Already confirmed (duplicate event) — acknowledge without re-notifying.
+      if (appointment.card_on_file && appointment.status === 'confirmed') {
+        return res.json({ received: true });
+      }
+
+      await supabase
+        .from('appointments')
+        .update({ status: 'confirmed', card_on_file: true })
+        .eq('id', appointment.id);
+
+      try {
+        let to = null;
+        let clientName = 'Valued Client';
+        let clientPhone = null;
+
+        if (appointment.client_id) {
+          const { data: userData } = await supabase.auth.admin.getUserById(appointment.client_id);
+          to = userData?.user?.email || null;
+          clientName = appointment.client?.full_name || 'Valued Client';
+          clientPhone = appointment.client?.phone || null;
+        } else {
+          to = appointment.guest_email || null;
+          clientName = appointment.guest_name || 'Valued Client';
+          clientPhone = appointment.guest_phone || null;
+        }
+
+        const serviceName = appointment.service?.name || 'Your service';
+        const staffName = appointment.staff?.full_name || 'Your stylist';
+
+        if (to) {
+          await sendBookingConfirmation({
+            to,
+            clientName,
+            serviceName,
+            staffName,
+            startTime: appointment.start_time,
+            totalCents: appointment.total_cents,
+            amountPaidCents: null,
+          });
+        }
+
+        await sendOwnerBookingAlert({
+          clientName,
+          clientEmail: to,
+          clientPhone,
+          serviceName,
+          staffName,
+          startTime: appointment.start_time,
+          totalCents: appointment.total_cents,
+          amountPaidCents: null,
+          notes: appointment.client_notes || null,
+          isGuest: !appointment.client_id,
+        });
+      } catch (emailError) {
+        console.error('Failed to send booking notifications after card setup:', emailError.message);
+      }
 
       break;
     }
