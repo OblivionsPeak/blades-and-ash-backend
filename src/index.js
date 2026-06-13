@@ -11,7 +11,7 @@ import availabilityRouter from './routes/availability.js';
 import paymentsRouter from './routes/payments.js';
 import discountsRouter from './routes/discounts.js';
 import adminRouter from './routes/admin.js';
-import { startReminderJob } from './jobs/reminders.js';
+import { startReminderJob, processReminders } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
 
@@ -194,6 +194,26 @@ app.use(express.urlencoded({ extended: true }));
 // ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ──────────────────────────────────────────────
+// Reminder trigger (for an external scheduler)
+// ──────────────────────────────────────────────
+// Lets a cron service (e.g. cron-job.org) run the reminder sweep without
+// relying on the in-process cron, which is unreliable when a free-tier
+// instance sleeps. Protected by a shared secret in the X-Cron-Secret header.
+// Disabled (503) unless CRON_SECRET is configured, so it's never an open hook.
+app.post('/api/internal/run-reminders', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) {
+    return res.status(503).json({ error: 'Reminder trigger is not configured (CRON_SECRET unset).' });
+  }
+  if (req.get('X-Cron-Secret') !== secret) {
+    return res.status(401).json({ error: 'Invalid cron secret' });
+  }
+
+  const summary = await processReminders();
+  return res.json({ ok: true, ...summary });
 });
 
 // ──────────────────────────────────────────────

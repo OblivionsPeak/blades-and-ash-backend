@@ -3,15 +3,27 @@ import { supabase } from '../supabase.js';
 import { sendAppointmentReminder } from '../lib/email.js';
 import { sendSmsReminder } from '../lib/sms.js';
 
+// In-process guard so two overlapping triggers (e.g. a slow sweep plus the
+// next external ping) can't double-send the same reminder. Single web
+// instance on Render, so a module-level flag is sufficient.
+let isRunning = false;
+
 /**
  * Process pending reminders.
- * Runs every 5 minutes.
  * For each pending reminder, check if it's time to send based on
  * appointment start_time and reminder type ('24h' or '2h').
+ * Returns a summary; safe to call concurrently (no-ops if already running).
  */
-async function processReminders() {
+export async function processReminders() {
+  if (isRunning) {
+    console.log('[reminders] Sweep already in progress — skipping this trigger.');
+    return { skipped: true, reason: 'already_running' };
+  }
+  isRunning = true;
   console.log('[reminders] Running reminder check at', new Date().toISOString());
 
+  let sent = 0;
+  let failed = 0;
   try {
     // Fetch all pending reminders joined with appointment + client + service + staff
     const { data: reminders, error } = await supabase
@@ -41,12 +53,12 @@ async function processReminders() {
 
     if (error) {
       console.error('[reminders] Failed to fetch reminders:', error.message);
-      return;
+      return { processed: 0, sent, error: error.message };
     }
 
     if (!reminders || reminders.length === 0) {
       console.log('[reminders] No pending reminders found.');
-      return;
+      return { processed: 0, sent };
     }
 
     const now = Date.now();
@@ -139,17 +151,24 @@ async function processReminders() {
           .update({ status: 'sent', sent_at: new Date().toISOString() })
           .eq('id', reminder.id);
 
+        sent += 1;
         console.log(`[reminders] Sent ${reminder.type} ${reminder.channel} reminder for appointment ${appointment.id}`);
       } catch (sendError) {
         console.error(
           `[reminders] Failed to send ${reminder.type} ${reminder.channel} reminder for appointment ${appointment.id}:`,
           sendError.message
         );
+        failed += 1;
         await markReminder(reminder.id, 'failed');
       }
     }
+
+    return { processed: reminders.length, sent, failed };
   } catch (err) {
     console.error('[reminders] Unexpected error in processReminders:', err.message);
+    return { processed: 0, sent, failed, error: err.message };
+  } finally {
+    isRunning = false;
   }
 }
 
@@ -165,7 +184,16 @@ async function markReminder(reminderId, status) {
 }
 
 export function startReminderJob() {
-  // Run every 5 minutes
+  // On Render's free tier the web service sleeps when idle, so an in-process
+  // cron is unreliable — set REMINDERS_TRIGGER=external and drive the sweep
+  // from an external scheduler hitting POST /api/internal/run-reminders.
+  // (Skipping the in-process cron also avoids double-sending.)
+  if (process.env.REMINDERS_TRIGGER === 'external') {
+    console.log('[reminders] External trigger mode — in-process cron disabled. Expecting POST /api/internal/run-reminders.');
+    return;
+  }
+
+  // Default: in-process cron every 5 minutes (fine on an always-on instance).
   cron.schedule('*/5 * * * *', processReminders, {
     scheduled: true,
     timezone: 'America/New_York',

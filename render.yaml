@@ -19,7 +19,16 @@ services:
         sync: false
       - key: RESEND_FROM
         sync: false
+      - key: OWNER_EMAIL
+        sync: false
       - key: SALON_TZ
+        sync: false
+      # Set to "external" so reminders are driven by an external scheduler
+      # (POST /api/internal/run-reminders) instead of the in-process cron,
+      # which is unreliable on the free tier. Pair with CRON_SECRET.
+      - key: REMINDERS_TRIGGER
+        sync: false
+      - key: CRON_SECRET
         sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
