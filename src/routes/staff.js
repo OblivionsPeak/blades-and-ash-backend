@@ -96,6 +96,77 @@ router.put('/:id/availability', requireAuth, async (req, res) => {
   return res.json([]);
 });
 
+// ──────────────────────────────────────────────
+// Time off / blocked dates
+// ──────────────────────────────────────────────
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function canManageStaff(req, id) {
+  return req.user.id === id || req.user.profile.role === 'admin';
+}
+
+// GET /:id/time-off — list a staff member's blocked date ranges (own or admin)
+router.get('/:id/time-off', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  if (!canManageStaff(req, id)) {
+    return res.status(403).json({ error: 'You can only view your own time off' });
+  }
+
+  const { data, error } = await supabase
+    .from('staff_time_off')
+    .select('*')
+    .eq('staff_id', id)
+    .order('start_date');
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json(data);
+});
+
+// POST /:id/time-off — block a date range (own staff or admin)
+router.post('/:id/time-off', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  if (!canManageStaff(req, id)) {
+    return res.status(403).json({ error: 'You can only set your own time off' });
+  }
+
+  const start_date = typeof req.body.start_date === 'string' ? req.body.start_date.trim() : '';
+  const end_date = typeof req.body.end_date === 'string' ? req.body.end_date.trim() : '';
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 200) : null;
+
+  if (!DATE_RE.test(start_date) || !DATE_RE.test(end_date)) {
+    return res.status(400).json({ error: 'start_date and end_date are required in YYYY-MM-DD format' });
+  }
+  if (end_date < start_date) {
+    return res.status(400).json({ error: 'end_date must be on or after start_date' });
+  }
+
+  const { data, error } = await supabase
+    .from('staff_time_off')
+    .insert({ staff_id: id, start_date, end_date, reason: reason || null })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.status(201).json(data);
+});
+
+// DELETE /:id/time-off/:blockId — remove a blocked range (own staff or admin)
+router.delete('/:id/time-off/:blockId', requireAuth, async (req, res) => {
+  const { id, blockId } = req.params;
+  if (!canManageStaff(req, id)) {
+    return res.status(403).json({ error: 'You can only remove your own time off' });
+  }
+
+  const { error } = await supabase
+    .from('staff_time_off')
+    .delete()
+    .eq('id', blockId)
+    .eq('staff_id', id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ message: 'Time off removed' });
+});
+
 // GET /:id/services — get services offered by this staff member (public)
 router.get('/:id/services', async (req, res) => {
   const { id } = req.params;

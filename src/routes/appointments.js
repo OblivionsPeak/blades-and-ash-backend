@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import Stripe from 'stripe';
+import { DateTime } from 'luxon';
 import { supabase } from '../supabase.js';
 import { requireAuth, optionalAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
@@ -9,6 +10,7 @@ import { computeFee, isValidFeeType } from '../lib/fees.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const SALON_TZ = process.env.SALON_TZ || 'America/Chicago';
 
 // Attach an `items` array to each appointment from appointment_services
 // (joined to services for the name). For LEGACY appointments with no
@@ -243,6 +245,24 @@ router.post('/', optionalAuth, async (req, res) => {
   const totalDuration = services.reduce((sum, s) => sum + s.duration_minutes, 0);
   const endTimeDate = new Date(startTimeDate.getTime() + totalDuration * 60 * 1000);
   const end_time = endTimeDate.toISOString();
+
+  // Reject bookings on a date the stylist has blocked off (vacation/holiday).
+  // The availability endpoint already hides these slots; this guards against a
+  // direct POST.
+  const bookingDate = DateTime.fromISO(start_time, { zone: SALON_TZ }).toISODate();
+  if (bookingDate) {
+    const { data: blocked, error: blockedError } = await supabase
+      .from('staff_time_off')
+      .select('id')
+      .eq('staff_id', staff_id)
+      .lte('start_date', bookingDate)
+      .gte('end_date', bookingDate)
+      .limit(1);
+    if (blockedError) return res.status(500).json({ error: blockedError.message });
+    if (blocked && blocked.length > 0) {
+      return res.status(409).json({ error: 'The stylist is unavailable on that date. Please choose another time.' });
+    }
+  }
 
   // Double-book prevention: check for conflicting appointments
   const { data: conflicts, error: conflictError } = await supabase

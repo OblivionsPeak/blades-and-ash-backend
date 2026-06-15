@@ -47,6 +47,19 @@ router.get('/', async (req, res) => {
     return res.status(400).json({ error: 'Invalid date provided' });
   }
 
+  // Blocked dates (vacation/holidays) override the weekly schedule: if the
+  // requested date falls inside any time-off range, there are no slots.
+  const { data: timeOff, error: timeOffError } = await supabase
+    .from('staff_time_off')
+    .select('id')
+    .eq('staff_id', staff_id)
+    .lte('start_date', date)
+    .gte('end_date', date)
+    .limit(1);
+
+  if (timeOffError) return res.status(500).json({ error: timeOffError.message });
+  if (timeOff && timeOff.length > 0) return res.json([]);
+
   // 1. Get the services to find the SUMMED duration_minutes
   const { data: services, error: serviceError } = await supabase
     .from('services')
