@@ -14,6 +14,7 @@ import adminRouter from './routes/admin.js';
 import { startReminderJob, processReminders } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
+import { recordPayment } from './lib/payments.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -104,9 +105,24 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         .update({
           stripe_payment_status: 'succeeded',
           status: 'confirmed',
-          amount_paid_cents: paymentIntent.amount_received,
         })
         .eq('id', appointment.id);
+
+      // Record the card payment in the ledger (idempotent on the PaymentIntent),
+      // which recomputes the appointment's cached amount_paid_cents.
+      try {
+        await recordPayment({
+          appointmentId: appointment.id,
+          clientId: appointment.client_id,
+          amountCents: paymentIntent.amount_received,
+          method: 'card',
+          kind: 'payment',
+          stripePaymentIntentId: paymentIntent.id,
+          note: paymentIntent.metadata?.payment_type === 'full' ? 'Online payment (full)' : 'Online payment',
+        });
+      } catch (ledgerError) {
+        console.error('Failed to record payment in ledger:', ledgerError.message);
+      }
 
       // Notify client + owner. Signed-in clients are looked up in auth.users;
       // guest bookings (client_id null) use the stored guest_email/guest_name.

@@ -282,6 +282,35 @@ create policy "Public read discounts"
   using (true);
 
 -- ──────────────────────────────────────────────────────────
+-- PAYMENTS LEDGER
+-- ──────────────────────────────────────────────────────────
+-- One row per payment event (cash, card, check) — the auditable source of
+-- truth for money collected. appointments.amount_paid_cents is a cached SUM of
+-- these rows, kept in sync by src/lib/payments.js. Cash and Stripe card
+-- payments share this ledger so it reconciles against Stripe payouts + bank.
+create table if not exists payments (
+  id uuid default gen_random_uuid() primary key,
+  appointment_id uuid references appointments(id) on delete set null,
+  client_id uuid references profiles(id) on delete set null,
+  amount_cents int not null,            -- positive = collected, negative = refund
+  method text not null check (method in ('card', 'cash', 'check', 'other')),
+  kind text not null default 'payment' check (kind in ('payment', 'fee', 'refund')),
+  stripe_payment_intent_id text,
+  note text,
+  recorded_by uuid references profiles(id) on delete set null,
+  created_at timestamptz default now()
+);
+
+create unique index if not exists payments_stripe_pi_unique
+  on payments (stripe_payment_intent_id)
+  where stripe_payment_intent_id is not null;
+create index if not exists payments_appointment_idx on payments (appointment_id);
+create index if not exists payments_created_idx on payments (created_at);
+
+-- Server-only (service role bypasses RLS). No policies = closed to anon/auth.
+alter table payments enable row level security;
+
+-- ──────────────────────────────────────────────────────────
 -- REMINDERS
 -- ──────────────────────────────────────────────────────────
 create table if not exists reminders (

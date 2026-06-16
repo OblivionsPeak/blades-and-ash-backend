@@ -105,6 +105,38 @@ router.get('/dashboard', requireAuth, requireRole('admin', 'staff'), async (req,
   }
 });
 
+// GET /payments — payments ledger for reconciliation (admin only). Optional
+// from/to (ISO) filters on created_at. Returns rows plus totals by method, so
+// the card subset can be tied to Stripe and the cash subset to the drawer/bank.
+router.get('/payments', requireAuth, requireRole('admin'), async (req, res) => {
+  const { from, to } = req.query;
+
+  let query = supabase
+    .from('payments')
+    .select(`
+      *,
+      appointment:appointments!payments_appointment_id_fkey(id, start_time, service:services!appointments_service_id_fkey(name)),
+      client:profiles!payments_client_id_fkey(full_name),
+      recorder:profiles!payments_recorded_by_fkey(full_name)
+    `)
+    .order('created_at', { ascending: false });
+
+  if (from) query = query.gte('created_at', from);
+  if (to) query = query.lte('created_at', to);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  const byMethod = {};
+  let total = 0;
+  for (const p of data || []) {
+    byMethod[p.method] = (byMethod[p.method] || 0) + (p.amount_cents || 0);
+    total += p.amount_cents || 0;
+  }
+
+  return res.json({ payments: data || [], totals: { by_method: byMethod, total_cents: total } });
+});
+
 // GET /appointments — admin view of all appointments with filters
 router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (req, res) => {
   const { status, staff_id, date, from, to, limit, offset } = req.query;

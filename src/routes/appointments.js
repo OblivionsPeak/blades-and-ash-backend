@@ -7,6 +7,7 @@ import { requireRole } from '../middleware/requireRole.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from '../lib/email.js';
 import { resolveDiscountForServices } from '../lib/discounts.js';
 import { computeFee, isValidFeeType } from '../lib/fees.js';
+import { recordPayment } from '../lib/payments.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -697,13 +698,28 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
     return res.status(402).json({ error: `Charge did not complete (status: ${paymentIntent.status}).` });
   }
 
+  // Record the fee in the ledger first — this recomputes amount_paid_cents — then
+  // persist the fee bookkeeping fields and return the refreshed appointment.
+  try {
+    await recordPayment({
+      appointmentId: id,
+      clientId: appointment.client_id,
+      amountCents: chargeableCents,
+      method: 'card',
+      kind: 'fee',
+      stripePaymentIntentId: paymentIntent.id,
+      note: fee_type === 'no_show' ? 'No-show fee' : 'Late-cancellation fee',
+    });
+  } catch (ledgerError) {
+    return res.status(500).json({ error: ledgerError.message });
+  }
+
   const { data: updated, error: updateError } = await supabase
     .from('appointments')
     .update({
       fee_type,
       fee_charged_cents: (appointment.fee_charged_cents || 0) + chargeableCents,
       fee_payment_intent_id: paymentIntent.id,
-      amount_paid_cents: (appointment.amount_paid_cents || 0) + chargeableCents,
     })
     .eq('id', id)
     .select()
@@ -712,6 +728,54 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
   if (updateError) return res.status(500).json({ error: updateError.message });
 
   return res.json({ charged: true, amount_cents: chargeableCents, fee_cents: feeCents, appointment: updated });
+});
+
+// POST /:id/record-payment — log an in-person payment (cash/check/other) to the
+// ledger, admin only. Card payments come through Stripe; this is how cash gets
+// into the books so the dashboard revenue and the payments report include it.
+router.post('/:id/record-payment', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { amount_cents, method, note } = req.body;
+
+  if (!['cash', 'check', 'other'].includes(method)) {
+    return res.status(400).json({ error: "method must be 'cash', 'check', or 'other'" });
+  }
+  if (!Number.isInteger(amount_cents) || amount_cents <= 0) {
+    return res.status(400).json({ error: 'amount_cents must be a positive integer' });
+  }
+
+  const { data: appointment, error: apptError } = await supabase
+    .from('appointments')
+    .select('id, client_id')
+    .eq('id', id)
+    .single();
+
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (apptError) return res.status(500).json({ error: apptError.message });
+
+  try {
+    await recordPayment({
+      appointmentId: id,
+      clientId: appointment.client_id,
+      amountCents: amount_cents,
+      method,
+      kind: 'payment',
+      note: note ? String(note).slice(0, 500) : null,
+      recordedBy: req.user.id,
+    });
+  } catch (ledgerError) {
+    return res.status(500).json({ error: ledgerError.message });
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('appointments')
+    .select('*')
+    .eq('id', id)
+    .single();
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  return res.json({ recorded: true, amount_cents, method, appointment: updated });
 });
 
 // POST /:id/apply-discount — apply (or remove) a discount on an appointment,
