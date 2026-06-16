@@ -74,7 +74,9 @@ router.post('/create-intent', requireAuth, async (req, res) => {
       });
       // Only persist if it improves on the current total (never raise it,
       // never overwrite a better discount already applied at booking).
-      if (result.ok && result.discounted_cents < totalCents) {
+      // admin_only codes are never honoured on the client-driven payment path —
+      // the salon applies those itself via the admin apply-discount endpoint.
+      if (result.ok && !result.discount.admin_only && result.discounted_cents < totalCents) {
         totalCents = result.discounted_cents;
         await supabase
           .from('appointments')

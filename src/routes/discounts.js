@@ -33,7 +33,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
 
 // POST / — create discount (admin only)
 router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
-  const { code, type, value, scope, expires_at, active } = req.body;
+  const { code, type, value, scope, expires_at, active, admin_only } = req.body;
 
   if (!code || typeof code !== 'string') {
     return res.status(400).json({ error: 'code is required' });
@@ -51,6 +51,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
       scope: scope || 'all',
       expires_at: expires_at || null,
       active: active !== undefined ? active : true,
+      admin_only: admin_only === true,
     })
     .select()
     .single();
@@ -68,7 +69,7 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res) => {
 // PUT /:id — update discount (admin only)
 router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   const { id } = req.params;
-  const { code, type, value, scope, expires_at, active } = req.body;
+  const { code, type, value, scope, expires_at, active, admin_only } = req.body;
 
   // If type or value is being changed, validate the resulting pair.
   if (type !== undefined || value !== undefined) {
@@ -83,6 +84,7 @@ router.put('/:id', requireAuth, requireRole('admin'), async (req, res) => {
   if (scope !== undefined) updates.scope = scope;
   if (expires_at !== undefined) updates.expires_at = expires_at;
   if (active !== undefined) updates.active = active;
+  if (admin_only !== undefined) updates.admin_only = admin_only === true;
 
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No fields provided to update' });
@@ -152,6 +154,13 @@ router.post('/validate', async (req, res) => {
 
   if (!result.ok) {
     return res.json({ valid: false, error: result.error });
+  }
+
+  // admin_only codes (e.g. military) are never self-serve — the salon applies
+  // them at checkout. Treat as not found so they can't be previewed or used
+  // from the public booking UI.
+  if (result.discount.admin_only) {
+    return res.json({ valid: false, error: 'Code not found' });
   }
 
   return res.json({

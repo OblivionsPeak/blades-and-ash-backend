@@ -714,6 +714,100 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
   return res.json({ charged: true, amount_cents: chargeableCents, fee_cents: feeCents, appointment: updated });
 });
 
+// POST /:id/apply-discount — apply (or remove) a discount on an appointment,
+// admin only. This is how eligibility-gated codes (e.g. military) get used:
+// the customer can never self-apply them, so the salon applies them here at
+// checkout. The new total is recomputed from the per-service price snapshot —
+// never from the stored total — so applying is idempotent and removable.
+// Pass discount_code: null (or "") to clear any applied discount.
+router.post('/:id/apply-discount', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { discount_code } = req.body;
+  const code = typeof discount_code === 'string' ? discount_code.trim() : '';
+
+  const { data: appointment, error: apptError } = await supabase
+    .from('appointments')
+    .select('*, service:services!appointments_service_id_fkey(price_cents, category)')
+    .eq('id', id)
+    .single();
+
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (apptError) return res.status(500).json({ error: apptError.message });
+  if (appointment.status === 'cancelled') {
+    return res.status(400).json({ error: 'Cannot change pricing on a cancelled appointment' });
+  }
+
+  // Build the service set from the price snapshot (multi-service rows, or the
+  // single primary service for legacy appointments) and derive the full
+  // un-discounted subtotal.
+  const { data: itemRows } = await supabase
+    .from('appointment_services')
+    .select('price_cents, service:services(category)')
+    .eq('appointment_id', id);
+
+  let serviceSet = null;
+  if (itemRows && itemRows.length > 0) {
+    serviceSet = itemRows.map((r) => ({ price_cents: r.price_cents, category: r.service?.category ?? null }));
+  } else if (appointment.service) {
+    serviceSet = [{ price_cents: appointment.service.price_cents, category: appointment.service.category }];
+  }
+  if (!serviceSet) {
+    return res.status(400).json({ error: 'No service pricing found for this appointment' });
+  }
+
+  const subtotalCents = serviceSet.reduce((sum, s) => sum + s.price_cents, 0);
+
+  let newTotal = subtotalCents;
+  let appliedCode = null;
+  let label = null;
+
+  if (code) {
+    const result = await resolveDiscountForServices(supabase, { code, services: serviceSet });
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    newTotal = result.discounted_cents;
+    appliedCode = result.discount.code;
+    label = result.label;
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('appointments')
+    .update({ total_cents: newTotal, discount_code: appliedCode })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // If a payment intent is already open (customer reached the pay step before
+  // the discount was applied), keep its amount in sync so they're not charged
+  // the old, higher figure. Only touch intents still awaiting payment — never a
+  // succeeded/processing one. Best-effort: a Stripe hiccup here must not undo
+  // the saved discount.
+  const amountCents = appointment.deposit_cents > 0
+    ? Math.min(appointment.deposit_cents, newTotal)
+    : newTotal;
+  if (appointment.stripe_payment_intent_id && amountCents > 0) {
+    try {
+      const pi = await stripe.paymentIntents.retrieve(appointment.stripe_payment_intent_id);
+      const editable = ['requires_payment_method', 'requires_confirmation', 'requires_action'];
+      if (editable.includes(pi.status) && pi.amount !== amountCents) {
+        await stripe.paymentIntents.update(appointment.stripe_payment_intent_id, { amount: amountCents });
+      }
+    } catch (stripeError) {
+      // Non-fatal — the stored total is the source of truth; a fresh intent
+      // (or the POS charge) will use the corrected amount.
+    }
+  }
+
+  return res.json({
+    appointment: updated,
+    original_cents: subtotalCents,
+    total_cents: newTotal,
+    discount_code: appliedCode,
+    label,
+  });
+});
+
 // PUT /:id/reschedule — move an appointment to a new start time. A client may
 // reschedule their own booking; staff/admin may reschedule any. Duration and
 // services are preserved (the new end is derived from the existing length).

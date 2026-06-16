@@ -181,6 +181,10 @@ create table if not exists appointments (
   total_cents int not null,
   deposit_cents int not null default 0,
   amount_paid_cents int not null default 0,
+  -- Code applied by the salon at checkout (admin-applied discounts). Null when
+  -- no discount is in effect; the total is always recomputed from the price
+  -- snapshot so the code can be changed or removed.
+  discount_code text,
   created_at timestamptz default now()
 );
 
@@ -263,6 +267,9 @@ create table if not exists discounts (
   scope text not null default 'all',
   expires_at timestamptz,
   active boolean default true,
+  -- admin_only codes (e.g. military) are applied by the salon at checkout and
+  -- are rejected by the public validate + client payment flows.
+  admin_only boolean not null default false,
   created_at timestamptz default now()
 );
 
