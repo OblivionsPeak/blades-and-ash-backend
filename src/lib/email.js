@@ -22,15 +22,25 @@ export function esc(value) {
     .replace(/'/g, '&#39;');
 }
 
-export async function sendAppointmentReminder({ to, clientName, serviceName, staffName, startTime }) {
-  const dateStr = new Date(startTime).toLocaleString('en-US', {
+// The salon is in Central time. Format appointment times in that zone so emails
+// don't render in the server's UTC. 'America/Chicago' tracks CST/CDT automatically,
+// so timeZoneName: 'short' shows the correct CST/CDT label. Override per-deploy if needed.
+const SALON_TZ = process.env.SALON_TIMEZONE || 'America/Chicago';
+
+function formatApptTime(startTime) {
+  return new Date(startTime).toLocaleString('en-US', {
     weekday: 'long',
     month: 'long',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: SALON_TZ,
     timeZoneName: 'short',
   });
+}
+
+export async function sendAppointmentReminder({ to, clientName, serviceName, staffName, startTime }) {
+  const dateStr = formatApptTime(startTime);
 
   const { data, error } = await resend.emails.send({
     from: FROM_ADDRESS,
@@ -80,14 +90,7 @@ export async function sendBookingConfirmation({
   amountPaidCents = null,
   paymentLabel = 'Deposit paid',
 }) {
-  const dateStr = new Date(startTime).toLocaleString('en-US', {
-    weekday: 'long',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  });
+  const dateStr = formatApptTime(startTime);
 
   const total = (totalCents / 100).toFixed(2);
   const paid = amountPaidCents ? (amountPaidCents / 100).toFixed(2) : null;
@@ -161,14 +164,7 @@ export async function sendOwnerBookingAlert({
   notes,
   isGuest = false,
 }) {
-  const dateStr = new Date(startTime).toLocaleString('en-US', {
-    weekday: 'long',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  });
+  const dateStr = formatApptTime(startTime);
 
   const total = (totalCents / 100).toFixed(2);
   const paid = amountPaidCents ? (amountPaidCents / 100).toFixed(2) : null;

@@ -6,6 +6,9 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
+// Salon is in Central time; format reminder times there, not the server's UTC.
+const SALON_TZ = process.env.SALON_TIMEZONE || 'America/Chicago';
+
 export async function sendSmsReminder({ to, clientName, serviceName, startTime }) {
   const dateStr = new Date(startTime).toLocaleString('en-US', {
     weekday: 'short',
@@ -13,6 +16,7 @@ export async function sendSmsReminder({ to, clientName, serviceName, startTime }
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: SALON_TZ,
   });
 
   const message = await client.messages.create({
