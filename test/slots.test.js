@@ -48,6 +48,22 @@ test('overlapping appointments remove conflicting slots', () => {
   assert.deepEqual(hours, ['10:00', '10:30']);
 });
 
+test('a partial-day time-off window removes only the overlapping slots', () => {
+  // Mirrors how availability.js turns a partial block into a busy window:
+  // block 12:00–14:00 on a 09:00–17:00 day, 60-min service. The 11:00 slot ends
+  // at 12:00 (ok), 12:00/13:00 starts fall inside the block, 14:00 is free again.
+  const partialBlock = {
+    start_time: DateTime.fromISO('2099-06-01T12:00', { zone: TZ }).toUTC().toISO(),
+    end_time: DateTime.fromISO('2099-06-01T14:00', { zone: TZ }).toUTC().toISO(),
+  };
+  const slots = generateSlots({
+    date: '2099-06-01', salonTz: TZ, availStart: '11:00', availEnd: '15:00',
+    durationMinutes: 60, existingAppointments: [partialBlock], nowMs: NOW,
+  });
+  const hours = slots.map((s) => DateTime.fromISO(s).setZone(TZ).toFormat('HH:mm'));
+  assert.deepEqual(hours, ['11:00', '14:00']);
+});
+
 test('slots already in the past are dropped', () => {
   // now = 10:00 salon time on the test day => only 10:00+ starts survive.
   const nowMid = DateTime.fromISO('2099-06-01T10:00', { zone: TZ }).toMillis();

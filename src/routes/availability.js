@@ -47,18 +47,32 @@ router.get('/', async (req, res) => {
     return res.status(400).json({ error: 'Invalid date provided' });
   }
 
-  // Blocked dates (vacation/holidays) override the weekly schedule: if the
-  // requested date falls inside any time-off range, there are no slots.
+  // Blocked time off overrides the weekly schedule. A whole-day block (no
+  // start_time/end_time) zeroes the day; a partial block only removes the slots
+  // that overlap its [start_time, end_time) window (handled as a busy period in
+  // step 4 below).
   const { data: timeOff, error: timeOffError } = await supabase
     .from('staff_time_off')
-    .select('id')
+    .select('start_time, end_time')
     .eq('staff_id', staff_id)
     .lte('start_date', date)
-    .gte('end_date', date)
-    .limit(1);
+    .gte('end_date', date);
 
   if (timeOffError) return res.status(500).json({ error: timeOffError.message });
-  if (timeOff && timeOff.length > 0) return res.json([]);
+
+  const timeOffRows = timeOff || [];
+  // Any whole-day block on this date => no availability at all.
+  if (timeOffRows.some((r) => !r.start_time || !r.end_time)) return res.json([]);
+
+  // Partial blocks become pseudo-appointments so overlapping slots drop out.
+  const blockedWindows = timeOffRows.map((r) => {
+    const [sh, sm] = String(r.start_time).split(':').map(Number);
+    const [eh, em] = String(r.end_time).split(':').map(Number);
+    return {
+      start_time: dayInSalonTz.plus({ hours: sh, minutes: sm }).toUTC().toISO(),
+      end_time: dayInSalonTz.plus({ hours: eh, minutes: em }).toUTC().toISO(),
+    };
+  });
 
   // 1. Get the services to find the SUMMED duration_minutes
   const { data: services, error: serviceError } = await supabase
@@ -121,7 +135,7 @@ router.get('/', async (req, res) => {
     availStart: availability.start_time,
     availEnd: availability.end_time,
     durationMinutes,
-    existingAppointments: existingAppointments || [],
+    existingAppointments: [...(existingAppointments || []), ...blockedWindows],
     nowMs: Date.now(),
   });
 

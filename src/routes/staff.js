@@ -100,6 +100,7 @@ router.put('/:id/availability', requireAuth, async (req, res) => {
 // Time off / blocked dates
 // ──────────────────────────────────────────────
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 function canManageStaff(req, id) {
   return req.user.id === id || req.user.profile.role === 'admin';
@@ -133,6 +134,13 @@ router.post('/:id/time-off', requireAuth, async (req, res) => {
   const end_date = typeof req.body.end_date === 'string' ? req.body.end_date.trim() : '';
   const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 200) : null;
 
+  // Optional time window for a partial-day block. Both must be present or both
+  // absent; absent = whole-day block (back-compat).
+  const start_time = typeof req.body.start_time === 'string' && req.body.start_time.trim()
+    ? req.body.start_time.trim() : null;
+  const end_time = typeof req.body.end_time === 'string' && req.body.end_time.trim()
+    ? req.body.end_time.trim() : null;
+
   if (!DATE_RE.test(start_date) || !DATE_RE.test(end_date)) {
     return res.status(400).json({ error: 'start_date and end_date are required in YYYY-MM-DD format' });
   }
@@ -140,9 +148,21 @@ router.post('/:id/time-off', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'end_date must be on or after start_date' });
   }
 
+  if ((start_time === null) !== (end_time === null)) {
+    return res.status(400).json({ error: 'start_time and end_time must both be provided, or both omitted for a whole-day block' });
+  }
+  if (start_time !== null) {
+    if (!TIME_RE.test(start_time) || !TIME_RE.test(end_time)) {
+      return res.status(400).json({ error: 'start_time and end_time must be in HH:MM format' });
+    }
+    if (end_time <= start_time) {
+      return res.status(400).json({ error: 'end_time must be after start_time' });
+    }
+  }
+
   const { data, error } = await supabase
     .from('staff_time_off')
-    .insert({ staff_id: id, start_date, end_date, reason: reason || null })
+    .insert({ staff_id: id, start_date, end_date, start_time, end_time, reason: reason || null })
     .select()
     .single();
 
