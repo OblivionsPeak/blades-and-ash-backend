@@ -11,6 +11,7 @@ import availabilityRouter from './routes/availability.js';
 import paymentsRouter from './routes/payments.js';
 import discountsRouter from './routes/discounts.js';
 import adminRouter from './routes/admin.js';
+import galleryRouter from './routes/gallery.js';
 import { startReminderJob, processReminders } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
@@ -355,6 +356,7 @@ app.use('/api/availability', availabilityRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/api/discounts', discountsRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/gallery', galleryRouter);
 
 // ──────────────────────────────────────────────
 // 404 Handler
