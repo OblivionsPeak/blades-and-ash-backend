@@ -8,6 +8,7 @@ import { sendBookingConfirmation, sendOwnerBookingAlert } from '../lib/email.js'
 import { resolveDiscountForServices } from '../lib/discounts.js';
 import { computeFee, isValidFeeType } from '../lib/fees.js';
 import { recordPayment } from '../lib/payments.js';
+import { isBookingBlocked } from '../lib/timeoff.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -247,21 +248,27 @@ router.post('/', optionalAuth, async (req, res) => {
   const endTimeDate = new Date(startTimeDate.getTime() + totalDuration * 60 * 1000);
   const end_time = endTimeDate.toISOString();
 
-  // Reject bookings on a date the stylist has blocked off (vacation/holiday).
-  // The availability endpoint already hides these slots; this guards against a
-  // direct POST.
+  // Reject bookings that fall in the stylist's time off. The availability
+  // endpoint already hides these slots; this guards against a direct POST.
+  // A whole-day block rejects the date outright; a partial-day block only
+  // rejects bookings that overlap its time window (lib/timeoff.js).
   const bookingDate = DateTime.fromISO(start_time, { zone: SALON_TZ }).toISODate();
   if (bookingDate) {
     const { data: blocked, error: blockedError } = await supabase
       .from('staff_time_off')
-      .select('id')
+      .select('start_time, end_time')
       .eq('staff_id', staff_id)
       .lte('start_date', bookingDate)
-      .gte('end_date', bookingDate)
-      .limit(1);
+      .gte('end_date', bookingDate);
     if (blockedError) return res.status(500).json({ error: blockedError.message });
-    if (blocked && blocked.length > 0) {
-      return res.status(409).json({ error: 'The stylist is unavailable on that date. Please choose another time.' });
+    if (isBookingBlocked({
+      blocks: blocked || [],
+      date: bookingDate,
+      salonTz: SALON_TZ,
+      bookingStartMs: startTimeDate.getTime(),
+      bookingEndMs: endTimeDate.getTime(),
+    })) {
+      return res.status(409).json({ error: 'The stylist is unavailable at that time. Please choose another time.' });
     }
   }
 

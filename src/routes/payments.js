@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { resolveDiscountForServices } from '../lib/discounts.js';
+import { computeChargeCents } from '../lib/balance.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -86,15 +87,17 @@ router.post('/create-intent', requireAuth, async (req, res) => {
     }
   }
 
-  // Determine amount: use deposit_cents if set, otherwise the (possibly
-  // discounted) total. A deposit is capped at the total in case a discount
-  // drops the total below the configured deposit.
-  const amountCents = appointment.deposit_cents > 0
-    ? Math.min(appointment.deposit_cents, totalCents)
-    : totalCents;
+  // Determine amount: the OUTSTANDING BALANCE (total minus everything already
+  // in the ledger — cash, prior card payments), so a partial payment never
+  // leads to an overcharge. Legacy deposit-era bookings cap at the deposit.
+  const amountCents = computeChargeCents({
+    totalCents,
+    amountPaidCents: appointment.amount_paid_cents,
+    depositCents: appointment.deposit_cents,
+  });
 
   if (!amountCents || amountCents <= 0) {
-    return res.status(400).json({ error: 'No payment amount found for this appointment' });
+    return res.status(400).json({ error: 'This appointment has no outstanding balance to pay.' });
   }
 
   try {
@@ -124,6 +127,15 @@ router.post('/create-intent', requireAuth, async (req, res) => {
             stripe_payment_status: paymentIntent.status,
           })
           .eq('id', appointment_id);
+      } else if (paymentIntent.amount !== amountCents) {
+        // Keep a still-pending intent in sync with the current balance —
+        // payments recorded (or discounts applied) since it was created must
+        // change what the card is charged. Never touch a succeeded/processing
+        // intent.
+        const editable = ['requires_payment_method', 'requires_confirmation', 'requires_action'];
+        if (editable.includes(paymentIntent.status)) {
+          paymentIntent = await stripe.paymentIntents.update(paymentIntent.id, { amount: amountCents });
+        }
       }
     } else {
       // Create a new PaymentIntent
