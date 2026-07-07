@@ -12,6 +12,7 @@ import paymentsRouter from './routes/payments.js';
 import discountsRouter from './routes/discounts.js';
 import adminRouter from './routes/admin.js';
 import galleryRouter from './routes/gallery.js';
+import settingsRouter from './routes/settings.js';
 import { startReminderJob, processReminders } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
@@ -357,6 +358,12 @@ app.use('/api/payments', paymentsRouter);
 app.use('/api/discounts', discountsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/gallery', galleryRouter);
+app.use('/api/settings', settingsRouter);
+
+// Lightweight liveness probe: no DB, no auth. Point an uptime pinger
+// (e.g. UptimeRobot, every 5-10 min) here to keep the Render instance warm
+// so customers never hit a free-tier cold start on the booking page.
+app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 // ──────────────────────────────────────────────
 // 404 Handler
