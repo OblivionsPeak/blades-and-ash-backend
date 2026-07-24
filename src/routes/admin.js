@@ -261,6 +261,199 @@ router.post('/clients', requireAuth, requireRole('admin'), async (req, res) => {
   return res.status(201).json({ client: { ...profile, email } });
 });
 
+// GET /clients/:id — one client profile plus their auth email (admin only).
+// The profiles table has no email column, so the list endpoint can't return
+// it; the edit form fetches it here.
+router.get('/clients/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', id)
+    .eq('role', 'client')
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const { data: authUser } = await supabase.auth.admin.getUserById(id);
+  return res.json({ client: { ...profile, email: authUser?.user?.email || null } });
+});
+
+// PUT /clients/:id — edit a client's name, phone, and email (admin only)
+router.put('/clients/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const fullName = typeof req.body.full_name === 'string' ? req.body.full_name.trim() : '';
+  const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : '';
+
+  if (!fullName) return res.status(400).json({ error: 'full_name is required' });
+  if (fullName.length > 120 || email.length > 254 || phone.length > 30) {
+    return res.status(400).json({ error: 'Client details are too long' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Please provide a valid email address' });
+  }
+  if (phone && !/^[\d\s()+.\-]{7,}$/.test(phone)) {
+    return res.status(400).json({ error: 'Please provide a valid phone number' });
+  }
+
+  // Only rows that are actually clients — staff/admins are edited elsewhere.
+  const { data: existing, error: findError } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('id', id)
+    .eq('role', 'client')
+    .single();
+
+  if (findError && findError.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (findError) return res.status(500).json({ error: findError.message });
+
+  if (email) {
+    const { data: authUser } = await supabase.auth.admin.getUserById(id);
+    if (authUser?.user && authUser.user.email !== email) {
+      const { error: emailError } = await supabase.auth.admin.updateUserById(id, {
+        email,
+        email_confirm: true,
+      });
+      if (emailError) {
+        if (/already (been )?registered|already exists/i.test(emailError.message)) {
+          return res.status(409).json({ error: 'A user with this email already exists' });
+        }
+        return res.status(500).json({ error: emailError.message });
+      }
+    }
+  }
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .update({ full_name: fullName, phone: phone || null })
+    .eq('id', existing.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ client: { ...profile, email: email || undefined } });
+});
+
+// DELETE /clients/:id — remove a client entirely (admin only). Their past
+// appointments are kept: the client's contact details are copied into the
+// guest_* columns first, then client_id goes null via ON DELETE SET NULL.
+// Deleting the auth user cascades to the profile and their service notes.
+router.delete('/clients/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('id, full_name, phone, role, stripe_customer_id')
+    .eq('id', id)
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (error) return res.status(500).json({ error: error.message });
+  if (profile.role !== 'client') {
+    return res.status(400).json({ error: 'Only clients can be deleted here. Demote staff/admins to client first.' });
+  }
+
+  const { data: authUser } = await supabase.auth.admin.getUserById(id);
+  const email = authUser?.user?.email || null;
+
+  const { error: keepError } = await supabase
+    .from('appointments')
+    .update({ guest_name: profile.full_name, guest_email: email, guest_phone: profile.phone })
+    .eq('client_id', id)
+    .is('guest_name', null);
+  if (keepError) return res.status(500).json({ error: keepError.message });
+
+  // Best-effort: drop the Stripe customer so no saved card outlives the client.
+  if (profile.stripe_customer_id) {
+    await stripe.customers.del(profile.stripe_customer_id).catch(() => {});
+  }
+
+  const { error: deleteError } = await supabase.auth.admin.deleteUser(id);
+  if (deleteError) return res.status(500).json({ error: deleteError.message });
+
+  return res.json({ ok: true });
+});
+
+// GET /clients/:id/notes — the client's service-note history, newest first
+// (admin only)
+router.get('/clients/:id/notes', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data, error } = await supabase
+    .from('client_service_notes')
+    .select('id, body, created_at, author:profiles!client_service_notes_author_id_fkey(id, full_name)')
+    .eq('client_id', id)
+    .order('created_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ notes: data });
+});
+
+// POST /clients/:id/notes — add a service note to a client (admin only)
+router.post('/clients/:id/notes', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+
+  if (!body) return res.status(400).json({ error: 'Note text is required' });
+  if (body.length > 4000) return res.status(400).json({ error: 'Note is too long (4000 characters max)' });
+
+  const { data: profile, error: findError } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('id', id)
+    .single();
+
+  if (findError && findError.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (findError) return res.status(500).json({ error: findError.message });
+
+  const { data, error } = await supabase
+    .from('client_service_notes')
+    .insert({ client_id: profile.id, author_id: req.user.id, body })
+    .select('id, body, created_at, author:profiles!client_service_notes_author_id_fkey(id, full_name)')
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.status(201).json({ note: data });
+});
+
+// PUT /clients/:id/notes/:noteId — edit a service note (admin only)
+router.put('/clients/:id/notes/:noteId', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id, noteId } = req.params;
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+
+  if (!body) return res.status(400).json({ error: 'Note text is required' });
+  if (body.length > 4000) return res.status(400).json({ error: 'Note is too long (4000 characters max)' });
+
+  const { data, error } = await supabase
+    .from('client_service_notes')
+    .update({ body })
+    .eq('id', noteId)
+    .eq('client_id', id)
+    .select('id, body, created_at, author:profiles!client_service_notes_author_id_fkey(id, full_name)')
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Note not found' });
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ note: data });
+});
+
+// DELETE /clients/:id/notes/:noteId — remove a service note (admin only)
+router.delete('/clients/:id/notes/:noteId', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id, noteId } = req.params;
+
+  const { error } = await supabase
+    .from('client_service_notes')
+    .delete()
+    .eq('id', noteId)
+    .eq('client_id', id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ ok: true });
+});
+
 // POST /clients/:id/card-setup — start saving a card on file (admin only).
 // Creates the Stripe Customer if needed and returns a SetupIntent client
 // secret; the admin UI confirms it with Stripe Elements so the raw card

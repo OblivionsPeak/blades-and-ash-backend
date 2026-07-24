@@ -162,7 +162,7 @@ create policy "Staff edits own availability"
 -- ──────────────────────────────────────────────────────────
 create table if not exists appointments (
   id uuid default gen_random_uuid() primary key,
-  client_id uuid references profiles(id),
+  client_id uuid references profiles(id) on delete set null,
   staff_id uuid references profiles(id),
   service_id uuid references services(id),
   start_time timestamptz not null,
@@ -309,6 +309,26 @@ create index if not exists payments_created_idx on payments (created_at);
 
 -- Server-only (service role bypasses RLS). No policies = closed to anon/auth.
 alter table payments enable row level security;
+
+-- ──────────────────────────────────────────────────────────
+-- CLIENT SERVICE NOTES
+-- ──────────────────────────────────────────────────────────
+-- The salon's private notes on a client ("used 6N + 20vol, 45 min
+-- processing"). One row per note so the history reads like a timeline.
+-- Distinct from the per-appointment notes/client_notes columns above.
+create table if not exists client_service_notes (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid not null references profiles(id) on delete cascade,
+  author_id uuid references profiles(id) on delete set null,
+  body text not null,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_client_service_notes_client
+  on client_service_notes (client_id, created_at desc);
+
+-- Server-only (service role bypasses RLS); notes are never shown to clients.
+alter table client_service_notes enable row level security;
 
 -- ──────────────────────────────────────────────────────────
 -- REMINDERS
