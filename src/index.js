@@ -227,10 +227,32 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         return res.json({ received: true });
       }
 
-      await supabase
+      // Pin the exact payment method this booking captured. A Stripe customer
+      // can hold more than one card, so "the customer's card" is ambiguous —
+      // this is what makes the card we later show and charge provably the one
+      // presented for THIS appointment.
+      const capturedMethod = typeof setupIntent.payment_method === 'string'
+        ? setupIntent.payment_method
+        : setupIntent.payment_method?.id || null;
+
+      const { error: confirmError } = await supabase
         .from('appointments')
-        .update({ status: 'confirmed', card_on_file: true })
+        .update({
+          status: 'confirmed',
+          card_on_file: true,
+          stripe_payment_method_id: capturedMethod,
+        })
         .eq('id', appointment.id);
+
+      // This is the only write that turns a booking into a real one. If it
+      // fails the appointment stays 'pending' forever while the client gets a
+      // confirmation email, so it must never fail quietly. Don't notify on a
+      // failed confirmation — a booking nobody can see is worse than a missing
+      // email, and Stripe retries when we don't acknowledge.
+      if (confirmError) {
+        console.error('CRITICAL: could not confirm appointment', appointment.id, confirmError);
+        return res.status(500).json({ error: 'Could not confirm appointment' });
+      }
 
       try {
         let to = null;

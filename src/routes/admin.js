@@ -207,6 +207,80 @@ router.get('/clients', requireAuth, requireRole('admin'), async (req, res) => {
   return res.json({ clients: data, total: count });
 });
 
+// GET /guests — list people who booked without an account (admin only).
+// Guest bookings are appointments with a null client_id, so they never show up
+// in /clients. Every guest booking also mints a fresh Stripe customer, so the
+// same person booking three times looks like three unrelated rows — we group
+// by lowercased guest_email in JS to collapse them back into one guest.
+router.get('/guests', requireAuth, requireRole('admin'), async (req, res) => {
+  const { search, limit, offset } = req.query;
+  // Guests are already collapsed one-per-person here, and the admin UI loads
+  // the list once and filters it locally — so allow a bigger page than the
+  // 200 the paged /clients list uses, or the UI would silently show a subset.
+  const { lim, off } = clampPagination(limit, offset, { maxLimit: 1000 });
+
+  // Aggregating in memory, so cap how much we pull. The salon's guest volume
+  // is far below this ceiling; newest bookings win if it's ever hit.
+  const MAX_ROWS = 5000;
+
+  const { data, error } = await supabase
+    .from('appointments')
+    .select('id, start_time, guest_name, guest_email, guest_phone, stripe_customer_id')
+    .is('client_id', null)
+    .not('guest_email', 'is', null)
+    .neq('guest_email', '')
+    .order('start_time', { ascending: false })
+    .limit(MAX_ROWS);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Rows arrive newest-first, so the first row seen for an email is that
+  // guest's most recent booking — name/phone/last_* all come from it.
+  const byEmail = new Map();
+  for (const appt of data || []) {
+    const email = String(appt.guest_email || '').trim().toLowerCase();
+    if (!email) continue;
+
+    const existing = byEmail.get(email);
+    if (existing) {
+      existing.bookings += 1;
+      if (appt.stripe_customer_id) existing.has_card = true;
+      continue;
+    }
+
+    byEmail.set(email, {
+      email,
+      name: appt.guest_name || null,
+      phone: appt.guest_phone || null,
+      bookings: 1,
+      last_appointment_at: appt.start_time,
+      last_appointment_id: appt.id,
+      has_card: Boolean(appt.stripe_customer_id),
+    });
+  }
+
+  let guests = Array.from(byEmail.values());
+
+  if (search) {
+    // Filtering happens in JS, but sanitise and cap the term the same way the
+    // query-side searches do so a pathological input can't be handed around.
+    const safe = String(search).replace(/[,()%_]/g, ' ').trim().slice(0, 100).toLowerCase();
+    if (safe) {
+      guests = guests.filter((g) =>
+        `${g.name || ''} ${g.email} ${g.phone || ''}`.toLowerCase().includes(safe)
+      );
+    }
+  }
+
+  // Most recently seen guests first.
+  guests.sort((a, b) => new Date(b.last_appointment_at) - new Date(a.last_appointment_at));
+
+  // Count the filtered set before paginating so the UI shows a true total.
+  const total = guests.length;
+
+  return res.json({ guests: guests.slice(off, off + lim), total });
+});
+
 // POST /clients — manually create a client profile (admin only). Creates a
 // real auth user (confirmed, passwordless) so the client can later claim the
 // account with a password reset / magic link, then upserts the profile row.
@@ -359,9 +433,21 @@ router.delete('/clients/:id', requireAuth, requireRole('admin'), async (req, res
   const { data: authUser } = await supabase.auth.admin.getUserById(id);
   const email = authUser?.user?.email || null;
 
+  // Keep the appointment history readable after the account is gone by copying
+  // the contact details into the guest columns. Clear the Stripe references in
+  // the same update: the customer is deleted just below, so leaving them behind
+  // would make these rows claim a card on file that no longer exists — and
+  // /guests, which reads exactly these columns, would report it as one.
   const { error: keepError } = await supabase
     .from('appointments')
-    .update({ guest_name: profile.full_name, guest_email: email, guest_phone: profile.phone })
+    .update({
+      guest_name: profile.full_name,
+      guest_email: email,
+      guest_phone: profile.phone,
+      stripe_customer_id: null,
+      stripe_payment_method_id: null,
+      card_on_file: false,
+    })
     .eq('client_id', id)
     .is('guest_name', null);
   if (keepError) return res.status(500).json({ error: keepError.message });

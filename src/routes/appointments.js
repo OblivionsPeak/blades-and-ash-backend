@@ -333,6 +333,12 @@ router.post('/', optionalAuth, async (req, res) => {
     try {
       let customerId = null;
       if (isGuest) {
+        // One Stripe customer per guest booking, deliberately. Reusing a prior
+        // guest's customer by email was tried and reverted: guest_email is
+        // unverified public input, so anyone typing a previous guest's address
+        // would inherit their saved card — visible via GET /:id/card and
+        // chargeable via charge-fee. Safe reuse needs the appointment to pin
+        // its own payment_method, not to share a customer.
         const customer = await stripe.customers.create({
           name: guestName || undefined,
           email: guestEmail || undefined,
@@ -619,6 +625,92 @@ router.delete('/:id', requireAuth, async (req, res) => {
   return res.json({ message: 'Appointment cancelled', appointment: data });
 });
 
+// Resolve the Stripe customer holding this appointment's card. The appointment's
+// own id wins (that's what makes guest bookings work); the profile is only a
+// fallback for older rows and admin-created bookings. Returns null when there's
+// nothing to resolve. Throws on a Supabase failure so callers can fail loudly.
+async function resolveAppointmentCustomer(appointment) {
+  if (appointment.stripe_customer_id) return appointment.stripe_customer_id;
+  if (!appointment.client_id) return null;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('stripe_customer_id')
+    .eq('id', appointment.client_id)
+    .single();
+  if (error) throw new Error(error.message);
+  return profile?.stripe_customer_id || null;
+}
+
+// Resolve the card that belongs to this appointment, as a Stripe PaymentMethod.
+//
+// Shared deliberately by the display endpoint and the charge endpoint: if these
+// two ever disagree, the admin is shown one card and a different one is charged.
+// They were separate implementations once and had exactly that bug.
+//
+// The method pinned at booking wins, but only while it is still attached to this
+// customer — a detached method still resolves and still reports its brand/last4,
+// so returning it unchecked would display a card that cannot be charged.
+//
+// Transient Stripe failures THROW rather than falling back. Falling back on a
+// timeout would quietly switch which card gets charged, and the fallback picks
+// the newest card, which for anyone with two saved cards is the wrong one.
+// Note: `customer` is compared as a string id — do not add `expand: ['customer']`
+// here or the comparison silently fails and pins stop being honoured.
+async function resolveAppointmentMethod(appointment, customerId) {
+  if (appointment.stripe_payment_method_id) {
+    let pinned = null;
+    try {
+      pinned = await stripe.paymentMethods.retrieve(appointment.stripe_payment_method_id);
+    } catch (stripeError) {
+      const code = stripeError.code || stripeError.raw?.code;
+      if (code !== 'resource_missing') throw stripeError;
+    }
+    if (pinned && pinned.customer === customerId) return pinned;
+  }
+
+  const methods = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
+  return methods.data[0] || null;
+}
+
+// GET /:id/card — the card on file for this appointment (admin only). Read-only
+// display for the admin UI: brand/last4/expiry only, never the payment method or
+// customer id. Uses the same resolver as charge-fee, so what's shown is always
+// the card that would actually be charged. No card on file is a normal state
+// here, not an error: it returns { card: null }.
+router.get('/:id/card', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: appointment, error: apptError } = await supabase
+    .from('appointments')
+    .select('id, client_id, stripe_customer_id, stripe_payment_method_id')
+    .eq('id', id)
+    .single();
+
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (apptError) return res.status(500).json({ error: apptError.message });
+  if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+  try {
+    const customerId = await resolveAppointmentCustomer(appointment);
+    if (!customerId) return res.json({ card: null });
+
+    const method = await resolveAppointmentMethod(appointment, customerId);
+    if (!method?.card) return res.json({ card: null });
+
+    return res.json({
+      card: {
+        brand: method.card.brand,
+        last4: method.card.last4,
+        exp_month: method.card.exp_month,
+        exp_year: method.card.exp_year,
+      },
+    });
+  } catch (lookupError) {
+    return res.status(500).json({ error: `Stripe error: ${lookupError.message}` });
+  }
+});
+
 // POST /:id/charge-fee — charge a no-show / late-cancellation fee to the
 // client's saved card (admin only). The fee policy lives in lib/fees.js;
 // already-collected payments (deposits) reduce what's charged now.
@@ -636,7 +728,7 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
 
   const { data: appointment, error: apptError } = await supabase
     .from('appointments')
-    .select('id, client_id, total_cents, amount_paid_cents, fee_charged_cents, stripe_customer_id')
+    .select('id, client_id, total_cents, amount_paid_cents, fee_charged_cents, stripe_customer_id, stripe_payment_method_id')
     .eq('id', id)
     .single();
 
@@ -658,38 +750,42 @@ router.post('/:id/charge-fee', requireAuth, requireRole('admin'), async (req, re
     });
   }
 
-  // Resolve the Stripe customer holding the saved card. New bookings store it
-  // on the appointment (so guests work too); fall back to the account profile
-  // for older bookings or admin-saved cards.
-  let customerId = appointment.stripe_customer_id || null;
-  if (!customerId && appointment.client_id) {
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('stripe_customer_id')
-      .eq('id', appointment.client_id)
-      .single();
-    if (profileError) return res.status(500).json({ error: profileError.message });
-    customerId = profile?.stripe_customer_id || null;
+  // Same resolver the card display uses, so the admin is never shown one card
+  // and charged another.
+  let customerId;
+  let paymentMethod;
+  try {
+    customerId = await resolveAppointmentCustomer(appointment);
+    if (!customerId) {
+      return res.status(400).json({ error: 'No card on file for this appointment.' });
+    }
+    paymentMethod = await resolveAppointmentMethod(appointment, customerId);
+  } catch (lookupError) {
+    // Fail closed: we could not confirm which card belongs to this appointment,
+    // so charge nothing rather than guess.
+    return res.status(502).json({ error: 'Could not verify the card on file. Please try again.' });
   }
-  if (!customerId) {
+
+  if (!paymentMethod) {
     return res.status(400).json({ error: 'No card on file for this appointment.' });
   }
 
   let paymentIntent;
   try {
-    const methods = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
-    if (!methods.data.length) {
-      return res.status(400).json({ error: 'No card on file for this appointment.' });
-    }
-
     paymentIntent = await stripe.paymentIntents.create({
       amount: chargeableCents,
       currency: 'usd',
       customer: customerId,
-      payment_method: methods.data[0].id,
+      payment_method: paymentMethod.id,
       off_session: true,
       confirm: true,
       metadata: { appointment_id: id, fee_type, kind: 'fee' },
+    }, {
+      // Two quick clicks both pass the "already covered" check above (both read
+      // the pre-charge amount_paid_cents), so without this the client is charged
+      // the fee twice. Keyed on the appointment and fee type, which is exactly
+      // the operation that must happen at most once.
+      idempotencyKey: `fee_${id}_${fee_type}_${chargeableCents}`,
     });
   } catch (stripeError) {
     // off_session charges can fail if the card needs authentication or is
