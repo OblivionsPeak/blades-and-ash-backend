@@ -677,13 +677,14 @@ async function resolveAppointmentMethod(appointment, customerId) {
 // display for the admin UI: brand/last4/expiry only, never the payment method or
 // customer id. Uses the same resolver as charge-fee, so what's shown is always
 // the card that would actually be charged. No card on file is a normal state
-// here, not an error: it returns { card: null }.
+// here, not an error: it returns { card: null } plus a `reason` so the UI can
+// say WHY, since "no card" has several innocent causes and one telling one.
 router.get('/:id/card', requireAuth, requireRole('admin'), async (req, res) => {
   const { id } = req.params;
 
   const { data: appointment, error: apptError } = await supabase
     .from('appointments')
-    .select('id, client_id, stripe_customer_id, stripe_payment_method_id')
+    .select('id, client_id, stripe_customer_id, stripe_payment_method_id, stripe_setup_intent_id, card_on_file')
     .eq('id', id)
     .single();
 
@@ -691,12 +692,26 @@ router.get('/:id/card', requireAuth, requireRole('admin'), async (req, res) => {
   if (apptError) return res.status(500).json({ error: apptError.message });
   if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
+  // Why is there no card? Inferred from what the booking actually recorded:
+  //   never_requested — no SetupIntent was ever created, so nothing asked for a
+  //                     card. Staff-created bookings skip capture by design,
+  //                     as do bookings predating the card-on-file requirement.
+  //   not_completed   — a SetupIntent exists but never succeeded: the client
+  //                     abandoned the card step. This is the one worth chasing.
+  //   removed         — a card WAS captured and is now gone (detached, or the
+  //                     customer was deleted).
+  const noCardReason = () => {
+    if (appointment.card_on_file) return 'removed';
+    if (appointment.stripe_setup_intent_id) return 'not_completed';
+    return 'never_requested';
+  };
+
   try {
     const customerId = await resolveAppointmentCustomer(appointment);
-    if (!customerId) return res.json({ card: null });
+    if (!customerId) return res.json({ card: null, reason: noCardReason() });
 
     const method = await resolveAppointmentMethod(appointment, customerId);
-    if (!method?.card) return res.json({ card: null });
+    if (!method?.card) return res.json({ card: null, reason: noCardReason() });
 
     return res.json({
       card: {
