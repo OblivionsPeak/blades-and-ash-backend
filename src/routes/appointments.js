@@ -14,6 +14,76 @@ const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const SALON_TZ = process.env.SALON_TZ || 'America/Chicago';
 
+// Whether the salon requires a card on file for HER OWN bookings too lives in
+// the settings object (one JSON file in a private Storage bucket — see
+// routes/settings.js). It is read server-side only; the request body never gets
+// a say in it. Booking is a hot path, so the flag is cached in memory: a toggle
+// taking up to a minute to take effect is fine, a Storage download on every
+// booking is not.
+const SETTINGS_BUCKET = 'settings';
+const SETTINGS_OBJECT = 'salon-info.json';
+const SETTINGS_TTL_MS = 60 * 1000;
+// A salon that has never saved settings has no object in the bucket. That is a
+// legitimate "the toggle is off", not a failure — same not-found shapes
+// routes/settings.js treats as `{}`.
+const SETTINGS_NOT_FOUND_RE = /not.?found|does not exist|400/i;
+let cachedRequireCard = false;
+let cachedRequireCardAt = 0;
+
+// Never throws: a settings read failure must not be able to break booking, so
+// the last known value stands (false on a cold cache — the pre-setting
+// behaviour) and the next booking retries. Only GENUINE failures retry; a
+// missing settings object caches like any other answer, so the common
+// never-configured salon doesn't pay a failed round trip on every booking.
+async function requireCardOnFileSetting() {
+  if (cachedRequireCardAt && Date.now() - cachedRequireCardAt < SETTINGS_TTL_MS) {
+    return cachedRequireCard;
+  }
+  try {
+    const { data, error } = await supabase.storage
+      .from(SETTINGS_BUCKET)
+      .download(SETTINGS_OBJECT);
+    if (error) {
+      if (SETTINGS_NOT_FOUND_RE.test(error.message || '')) {
+        cachedRequireCard = false;
+        cachedRequireCardAt = Date.now();
+        return cachedRequireCard;
+      }
+      throw new Error(error.message);
+    }
+    const parsed = JSON.parse(await data.text());
+    cachedRequireCard = parsed?.require_card_on_file === true;
+    cachedRequireCardAt = Date.now();
+  } catch (settingsError) {
+    console.error('Could not read require_card_on_file setting:', settingsError.message);
+  }
+  return cachedRequireCard;
+}
+
+// Called by PUT /settings after a successful save. Without this the salon can
+// flip the toggle, immediately test a booking, get the OLD behaviour for up to a
+// minute, and reasonably conclude the setting is broken. Only the timestamp is
+// cleared, never the value: if the very next read fails transiently the last
+// known answer still stands, exactly as above.
+export function invalidateRequireCardOnFileCache() {
+  cachedRequireCardAt = 0;
+}
+
+// A saved card is only reusable if it is still valid when the fee could be
+// charged — that's AFTER the visit, not at booking, so the appointment's start
+// month is the bar. `paymentMethods.list` does not filter expired cards, so
+// without this a card that expired last year gets pinned and the booking
+// confirms silently. Anything we can't read an expiry from is treated as
+// unusable: falling through to collecting a card is always the safe direction.
+function isCardUsableAt(method, startTime) {
+  const card = method?.card;
+  if (!card || !card.exp_year || !card.exp_month) return false;
+  const start = DateTime.fromISO(startTime, { zone: SALON_TZ });
+  if (!start.isValid) return false;
+  // Cards are valid through the END of their expiry month.
+  return card.exp_year * 12 + card.exp_month >= start.year * 12 + start.month;
+}
+
 // Attach an `items` array to each appointment from appointment_services
 // (joined to services for the name). For LEGACY appointments with no
 // appointment_services rows, synthesize a single item from the primary
@@ -304,8 +374,48 @@ router.post('/', optionalAuth, async (req, res) => {
   // Card-on-file replaces deposits: nothing is charged at booking. Public
   // (self-service) bookings MUST save a card via a Stripe SetupIntent so a
   // no-show / late-cancel fee can be charged later. Admin walk-in/phone
-  // bookings are settled in person and skip card capture.
-  const cardRequired = !isAdminBooking;
+  // bookings are settled in person and skip card capture — UNLESS the salon
+  // has turned on require_card_on_file, which extends the same rule to the
+  // bookings she takes herself so those clients can be charged a fee too.
+  const requireCardForAdmin = isAdminBooking ? await requireCardOnFileSetting() : false;
+  const cardRequired = !isAdminBooking || requireCardForAdmin;
+
+  // If an admin booking now needs a card and the client ALREADY has one saved,
+  // don't make her ask for it again: pin the newest saved method to this
+  // appointment (an explicit pin, so it can't drift to a different card later)
+  // and confirm immediately. Same resolvers the card display and charge-fee use,
+  // so what gets pinned is what would actually be charged. If anything about the
+  // lookup is uncertain we fall through and collect a card rather than book
+  // without one.
+  let reusedCustomerId = null;
+  let reusedMethod = null;
+  if (requireCardForAdmin) {
+    try {
+      const customerId = await resolveAppointmentCustomer({
+        client_id: clientId,
+        stripe_customer_id: null,
+      });
+      if (customerId) {
+        const method = await resolveAppointmentMethod({ stripe_payment_method_id: null }, customerId);
+        if (method && isCardUsableAt(method, start_time)) {
+          reusedCustomerId = customerId;
+          reusedMethod = method;
+        } else if (method) {
+          // Saved but expired by the time of the visit — collecting a fresh card
+          // is the whole point of the setting for exactly this client.
+          console.log('Saved card is expired for this appointment; collecting a new one instead.');
+        }
+      }
+    } catch (cardLookupError) {
+      console.error('Saved-card lookup failed for admin booking:', cardLookupError.message);
+    }
+  }
+  const cardReused = !!reusedMethod;
+
+  // A card still has to be COLLECTED whenever one is required and none was
+  // reused. This is what drives the SetupIntent, the pending status, and the
+  // "confirmed now" notification block below.
+  const collectCard = cardRequired && !cardReused;
 
   // Create appointment. service_id is the FIRST/primary service so existing
   // single-service joins keep working; the full set is stored in
@@ -316,7 +426,7 @@ router.post('/', optionalAuth, async (req, res) => {
     service_id: primaryService.id,
     start_time,
     end_time,
-    status: cardRequired ? 'pending' : 'confirmed',
+    status: collectCard ? 'pending' : 'confirmed',
     client_notes: client_notes || null,
     total_cents: totalCents,
     deposit_cents: 0,
@@ -327,9 +437,17 @@ router.post('/', optionalAuth, async (req, res) => {
     guest_phone: guestPhone,
   };
 
+  // Card already on file: pin it to this appointment and it's confirmed as-is —
+  // no Stripe customer creation, no SetupIntent, nothing for the admin to do.
+  if (cardReused) {
+    appointmentData.stripe_customer_id = reusedCustomerId;
+    appointmentData.stripe_payment_method_id = reusedMethod.id;
+    appointmentData.card_on_file = true;
+  }
+
   // Set up the Stripe customer + SetupIntent that captures the card on file.
   let setupIntent = null;
-  if (cardRequired) {
+  if (collectCard) {
     try {
       let customerId = null;
       if (isGuest) {
@@ -365,12 +483,30 @@ router.post('/', optionalAuth, async (req, res) => {
         }
       }
 
-      setupIntent = await stripe.setupIntents.create({
-        customer: customerId,
+      const setupIntentParams = {
         usage: 'off_session',
         payment_method_types: ['card'],
         metadata: { service_name: primaryService.name },
-      });
+      };
+
+      try {
+        setupIntent = await stripe.setupIntents.create({ ...setupIntentParams, customer: customerId });
+      } catch (setupError) {
+        const code = setupError.code || setupError.raw?.code;
+        // A profile can hold a stripe_customer_id for a customer that no longer
+        // exists in Stripe (deleted, or restored from another Stripe account).
+        // Failing here would make that client unbookable — turning a policy ON
+        // must never do that — so replace the dead id and retry exactly once.
+        if (code !== 'resource_missing' || isGuest || !clientId) throw setupError;
+        const customer = await stripe.customers.create({
+          name: bookedForName || undefined,
+          email: bookedForEmail || undefined,
+          metadata: { profile_id: clientId },
+        });
+        customerId = customer.id;
+        await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', clientId);
+        setupIntent = await stripe.setupIntents.create({ ...setupIntentParams, customer: customerId });
+      }
 
       appointmentData.stripe_customer_id = customerId;
       appointmentData.stripe_setup_intent_id = setupIntent.id;
@@ -430,10 +566,11 @@ router.post('/', optionalAuth, async (req, res) => {
 
   await supabase.from('reminders').insert(reminderRows);
 
-  // Admin (in-person) bookings have no card step and are confirmed immediately,
-  // so notify the client and owner now. Card-required bookings instead fire
-  // these from the Stripe webhook once the card is saved (setup_intent.succeeded).
-  if (!cardRequired) {
+  // Bookings with no card step (admin in-person, or an admin booking that
+  // reused a card already on file) are confirmed immediately, so notify the
+  // client and owner now. Bookings still awaiting a card instead fire these
+  // from the Stripe webhook once it's saved (setup_intent.succeeded).
+  if (!collectCard) {
     try {
       const { data: staffProfile } = await supabase
         .from('profiles')
@@ -482,6 +619,12 @@ router.post('/', optionalAuth, async (req, res) => {
   if (setupIntent) {
     response.setup_client_secret = setupIntent.client_secret;
   }
+  // ADDED for the admin card-on-file flow — the public flow's fields above are
+  // unchanged. `card_status` tells the caller which of the three outcomes it got:
+  //   'reused'       — a card already on file was pinned; booking is confirmed
+  //   'collect'      — a card must be collected now (setup_client_secret is set)
+  //   'not_required' — this booking needs no card at all
+  response.card_status = cardReused ? 'reused' : (setupIntent ? 'collect' : 'not_required');
 
   return res.status(201).json(response);
 });
@@ -724,6 +867,202 @@ router.get('/:id/card', requireAuth, requireRole('admin'), async (req, res) => {
   } catch (lookupError) {
     return res.status(500).json({ error: `Stripe error: ${lookupError.message}` });
   }
+});
+
+// Send the client confirmation + owner alert for an appointment that has just
+// become confirmed OUTSIDE the booking request — i.e. skip-card, where no
+// setup_intent.succeeded webhook will ever fire to do it. Deliberately a
+// separate loader rather than a refactor of the inline block in POST /, which
+// depends on a dozen in-scope variables from that request.
+//
+// Loads the same joins POST sends from and reproduces its multi-service
+// "X and N more" naming and its isGuest handling: guests are contacted at
+// guest_email, account holders at their auth email. Throws on failure — every
+// caller treats notification as non-fatal.
+async function sendConfirmationEmails(appointmentId) {
+  const { data: appointment, error } = await supabase
+    .from('appointments')
+    .select(`
+      *,
+      client:profiles!appointments_client_id_fkey(id, full_name, phone),
+      service:services!appointments_service_id_fkey(name),
+      staff:profiles!appointments_staff_id_fkey(full_name)
+    `)
+    .eq('id', appointmentId)
+    .single();
+
+  if (error) throw new Error(error.message);
+  if (!appointment) throw new Error(`Appointment ${appointmentId} not found`);
+
+  const isGuest = !appointment.client_id;
+
+  let to = null;
+  let clientDisplayName;
+  if (isGuest) {
+    to = appointment.guest_email || null;
+    clientDisplayName = appointment.guest_name || 'there';
+  } else {
+    const { data: userData } = await supabase.auth.admin.getUserById(appointment.client_id);
+    to = userData?.user?.email || null;
+    clientDisplayName = appointment.client?.full_name || 'there';
+  }
+
+  // Same naming POST uses: the primary service, plus a count of the rest.
+  const primaryName = appointment.service?.name || 'Your service';
+  const { data: items } = await supabase
+    .from('appointment_services')
+    .select('id')
+    .eq('appointment_id', appointmentId);
+  const extraCount = (items?.length || 0) - 1;
+  const serviceName = extraCount > 0 ? `${primaryName} and ${extraCount} more` : primaryName;
+  const staffName = appointment.staff?.full_name || 'Your stylist';
+
+  if (to) {
+    await sendBookingConfirmation({
+      to,
+      clientName: clientDisplayName,
+      serviceName,
+      staffName,
+      startTime: appointment.start_time,
+      totalCents: appointment.total_cents,
+      amountPaidCents: null,
+    });
+  }
+
+  await sendOwnerBookingAlert({
+    clientName: clientDisplayName,
+    clientEmail: to,
+    clientPhone: isGuest ? appointment.guest_phone || null : null,
+    serviceName,
+    staffName,
+    startTime: appointment.start_time,
+    totalCents: appointment.total_cents,
+    amountPaidCents: null,
+    notes: appointment.client_notes || null,
+    isGuest,
+  });
+}
+
+// POST /:id/skip-card — confirm a booking the salon has decided to take without
+// a card (admin only). The appointment already exists and is sitting pending on
+// a live SetupIntent, so this cancels that intent and clears the reference.
+// Without it the booking is indistinguishable from a client who abandoned the
+// card step — the card display would report exactly that, which is the opposite
+// of what happened — and an uncompletable SetupIntent would sit in Stripe.
+router.post('/:id/skip-card', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: appointment, error: apptError } = await supabase
+    .from('appointments')
+    .select('id, status, card_on_file, stripe_setup_intent_id')
+    .eq('id', id)
+    .single();
+
+  if (apptError && apptError.code === 'PGRST116') return res.status(404).json({ error: 'Appointment not found' });
+  if (apptError) return res.status(500).json({ error: apptError.message });
+  if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+  if (appointment.card_on_file) {
+    return res.status(409).json({ error: 'A card was saved for this appointment — nothing to skip.' });
+  }
+
+  // Only a booking still waiting on a card can be skipped. Without this an
+  // admin hitting this endpoint on a cancelled or completed appointment would
+  // resurrect it to 'confirmed' — re-double-booking a slot that may have been
+  // rebooked since — and email the client a fresh confirmation for it.
+  if (appointment.status !== 'pending') {
+    return res.status(409).json({
+      error: `This appointment is ${appointment.status}, not awaiting a card — nothing to skip.`,
+    });
+  }
+
+  // STRIPE IS THE SOURCE OF TRUTH FOR "did a card arrive?", not card_on_file:
+  // the column is only written by the webhook, which lags the client's card by
+  // seconds. Ask Stripe BEFORE doing anything destructive, because the failure
+  // mode is silent and bad — Stripe refuses to cancel a succeeded intent, and
+  // clearing the reference on top of that would strand the webhook (it looks
+  // the row up by stripe_setup_intent_id) leaving a card attached in Stripe
+  // that the DB says doesn't exist.
+  let intentCancelled = false;
+  if (appointment.stripe_setup_intent_id) {
+    let intent = null;
+    try {
+      intent = await stripe.setupIntents.retrieve(appointment.stripe_setup_intent_id);
+    } catch (retrieveError) {
+      // Couldn't check. Confirm the booking anyway (that part is safe) but touch
+      // nothing in Stripe and keep the reference so the webhook can reconcile.
+      console.error('Could not retrieve SetupIntent before skip-card:', retrieveError.message);
+    }
+
+    if (intent?.status === 'succeeded') {
+      return res.status(409).json({
+        error: 'A card was saved for this appointment — nothing to skip.',
+      });
+    }
+
+    if (intent?.status === 'canceled') {
+      // Already gone: nothing left that a late webhook could match.
+      intentCancelled = true;
+    } else if (intent) {
+      try {
+        await stripe.setupIntents.cancel(appointment.stripe_setup_intent_id);
+        intentCancelled = true;
+      } catch (cancelError) {
+        // Leave the reference in place so a late webhook can still find and
+        // reconcile this row. The booking is still confirmed below.
+        console.error('Could not cancel SetupIntent during skip-card:', cancelError.message);
+      }
+    }
+  }
+
+  // Only drop the reference when the intent is provably dead. Guard the write on
+  // card_on_file still being false: the webhook could have landed between the
+  // read above and here, and confirming-without-a-card must never throw away a
+  // card that just arrived.
+  const updates = { status: 'confirmed' };
+  if (intentCancelled) updates.stripe_setup_intent_id = null;
+
+  // The filters ARE the concurrency guard — a compare-and-swap, not the earlier
+  // read. Two simultaneous clicks (double click, two tabs, a retried request)
+  // would both have read 'pending' above; only one can match here, so only one
+  // confirms and only one email goes out.
+  const { data: updated, error: updateError } = await supabase
+    .from('appointments')
+    .update(updates)
+    .eq('id', id)
+    .eq('card_on_file', false)
+    .eq('status', 'pending')
+    .select()
+    .single();
+
+  if (updateError && updateError.code === 'PGRST116') {
+    // Nothing matched, so something changed underneath us. Re-read to say which.
+    const { data: current } = await supabase
+      .from('appointments')
+      .select('status, card_on_file')
+      .eq('id', id)
+      .single();
+    if (current?.card_on_file) {
+      return res.status(409).json({ error: 'A card was saved for this appointment — nothing to skip.' });
+    }
+    return res.status(409).json({ error: 'This appointment was already confirmed — nothing to skip.' });
+  }
+  if (updateError) return res.status(500).json({ error: updateError.message });
+
+  // This booking is now confirmed and NO setup_intent.succeeded webhook will
+  // ever fire for it, so this is the only chance to tell anyone it exists.
+  // Without it the client's first contact is a 24h reminder (jobs/reminders.js)
+  // for an appointment they were never told about.
+  // Reaching here means this request is the one that moved it pending ->
+  // confirmed, so exactly one confirmation goes out.
+  try {
+    await sendConfirmationEmails(id);
+  } catch (emailError) {
+    // Non-fatal, exactly like POST /: never fail the request over an email.
+    console.error('Failed to send booking notification after skip-card:', emailError.message);
+  }
+
+  return res.json({ appointment: updated });
 });
 
 // POST /:id/charge-fee — charge a no-show / late-cancellation fee to the

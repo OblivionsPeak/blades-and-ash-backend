@@ -15,6 +15,11 @@ const TEXT_FIELDS = {
   public_email: 120,
 };
 
+// Booleans stored as real booleans. Anything that isn't literally `true`
+// (missing, "true", 1, null, junk) reads as false, so a policy switch can only
+// ever be turned on deliberately.
+const BOOL_FIELDS = ['require_card_on_file'];
+
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/; // "HH:MM" 24h
 
 function cleanText(value, maxLen) {
@@ -34,6 +39,10 @@ function cleanUrl(value) {
   } catch {
     return '';
   }
+}
+
+function cleanBool(value) {
+  return value === true;
 }
 
 function cleanHours(hours) {
@@ -63,6 +72,9 @@ export function sanitizeSettings(input) {
   }
   for (const key of URL_FIELDS) {
     out[key] = cleanUrl(raw[key]);
+  }
+  for (const key of BOOL_FIELDS) {
+    out[key] = cleanBool(raw[key]);
   }
   out.hours = cleanHours(raw.hours);
   return out;

@@ -227,6 +227,12 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         return res.json({ received: true });
       }
 
+      // Confirmed but with no card recorded means the salon already took this
+      // booking without one (skip-card) and the client has already been told.
+      // The intent can still succeed afterwards if Stripe refused to cancel it,
+      // so pin the card that arrived — but do NOT send a second confirmation.
+      const alreadyAnnounced = appointment.status === 'confirmed';
+
       // Pin the exact payment method this booking captured. A Stripe customer
       // can hold more than one card, so "the customer's card" is ambiguous —
       // this is what makes the card we later show and charge provably the one
@@ -252,6 +258,11 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
       if (confirmError) {
         console.error('CRITICAL: could not confirm appointment', appointment.id, confirmError);
         return res.status(500).json({ error: 'Could not confirm appointment' });
+      }
+
+      // The card is now pinned either way; the client just doesn't need telling twice.
+      if (alreadyAnnounced) {
+        return res.json({ received: true });
       }
 
       try {

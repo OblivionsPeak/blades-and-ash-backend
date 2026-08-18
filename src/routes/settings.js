@@ -3,6 +3,7 @@ import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { sanitizeSettings } from '../lib/settings.js';
+import { invalidateRequireCardOnFileCache } from './appointments.js';
 
 const router = Router();
 
@@ -64,6 +65,10 @@ router.put('/', requireAuth, requireRole('admin'), async (req, res) => {
         cacheControl: '0',
       });
     if (error) return res.status(500).json({ error: error.message });
+    // require_card_on_file is cached in-process by the booking route. Without
+    // this, flipping the toggle and immediately testing a booking gets the OLD
+    // behaviour for up to a minute and looks broken.
+    invalidateRequireCardOnFileCache();
     return res.json(clean);
   } catch (e) {
     return res.status(500).json({ error: e.message });

@@ -65,5 +65,14 @@ test('empty/garbage input yields the empty shape', () => {
     const out = sanitizeSettings(input);
     assert.equal(out.business_name, '');
     assert.deepEqual(out.hours, {});
+    assert.equal(out.require_card_on_file, false);
+  }
+});
+
+test('require_card_on_file: only a real true enables it', () => {
+  assert.equal(sanitizeSettings({ require_card_on_file: true }).require_card_on_file, true);
+  for (const value of ['true', 'yes', 1, 'on', {}, [], 'false', 0, null, undefined]) {
+    const out = sanitizeSettings({ require_card_on_file: value });
+    assert.equal(out.require_card_on_file, false, `expected false for ${JSON.stringify(value)}`);
   }
 });
