@@ -183,7 +183,10 @@ router.get('/appointments', requireAuth, requireRole('admin', 'staff'), async (r
 // GET /clients — list all client profiles (admin only)
 router.get('/clients', requireAuth, requireRole('admin'), async (req, res) => {
   const { search, limit, offset } = req.query;
-  const { lim, off } = clampPagination(limit, offset);
+  // The admin UI loads this list once and searches it locally, so a short page
+  // would hide every client past the cut — including one just added. Allow the
+  // same 1000 the guests list does; the salon's roster is far below that.
+  const { lim, off } = clampPagination(limit, offset, { maxLimit: 1000 });
 
   let query = supabase
     .from('profiles')
