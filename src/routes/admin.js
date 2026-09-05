@@ -4,6 +4,7 @@ import { DateTime } from 'luxon';
 import { supabase } from '../supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/requireRole.js';
+import { attachItems } from './appointments.js';
 
 const router = Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -204,8 +205,37 @@ router.get('/clients', requireAuth, requireRole('admin'), async (req, res) => {
   const { data, error, count } = await query;
 
   if (error) return res.status(500).json({ error: error.message });
-  return res.json({ clients: data, total: count });
+
+  // Stamp each row with when they last signed the waiver / filled the
+  // consultation, so the list can show it at a glance without a per-row fetch.
+  const clients = await attachFormDates(data || []);
+  return res.json({ clients, total: count });
 });
+
+// Latest waiver + consultation dates for a page of clients, in one query.
+// Matches on client_id only — forms signed as a guest (before the account
+// existed) show up in the client's full profile view, which also matches on
+// email, but not in the list.
+async function attachFormDates(rows) {
+  const ids = rows.map((r) => r.id);
+  if (ids.length === 0) return rows;
+  const { data: forms, error } = await supabase
+    .from('client_forms')
+    .select('client_id, kind, created_at')
+    .in('client_id', ids)
+    .order('created_at', { ascending: false });
+  if (error) return rows;
+  const latest = new Map(); // `${client_id}:${kind}` -> created_at
+  for (const f of forms || []) {
+    const key = `${f.client_id}:${f.kind}`;
+    if (!latest.has(key)) latest.set(key, f.created_at);
+  }
+  return rows.map((r) => ({
+    ...r,
+    waiver_signed_at: latest.get(`${r.id}:waiver`) || null,
+    consultation_at: latest.get(`${r.id}:consultation`) || null,
+  }));
+}
 
 // GET /guests — list people who booked without an account (admin only).
 // Guest bookings are appointments with a null client_id, so they never show up
@@ -353,6 +383,76 @@ router.get('/clients/:id', requireAuth, requireRole('admin'), async (req, res) =
 
   const { data: authUser } = await supabase.auth.admin.getUserById(id);
   return res.json({ client: { ...profile, email: authUser?.user?.email || null } });
+});
+
+// GET /clients/:id/summary — everything the salon wants at a glance before
+// booking or serving a client: contact, card on file, forms on file (waiver +
+// consultation, matched by account OR by the email they typed, so a waiver
+// signed as a guest before they made an account still counts), and their
+// appointments with what's been paid on each.
+router.get('/clients/:id/summary', requireAuth, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', id)
+    .single();
+
+  if (error && error.code === 'PGRST116') return res.status(404).json({ error: 'Client not found' });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const { data: authUser } = await supabase.auth.admin.getUserById(id);
+  const email = authUser?.user?.email || null;
+
+  // Forms: by account, plus by email for anything submitted before/without
+  // the account being linked.
+  let formsQuery = supabase
+    .from('client_forms')
+    .select('id, kind, client_id, client_name, client_email, agreement_version, created_at')
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (email) {
+    const safe = email.replace(/[,()%_]/g, '');
+    formsQuery = formsQuery.or(`client_id.eq.${id},client_email.ilike.${safe}`);
+  } else {
+    formsQuery = formsQuery.eq('client_id', id);
+  }
+  const { data: forms } = await formsQuery;
+
+  const latest = {};
+  for (const f of forms || []) {
+    if (!latest[f.kind]) latest[f.kind] = f;
+  }
+
+  // Appointments, newest first. `items` mirrors what the appointments API
+  // returns so the UI can reuse apptServiceNames().
+  const { data: appts, error: apptError } = await supabase
+    .from('appointments')
+    .select(`
+      id, start_time, end_time, status, total_cents, deposit_cents, amount_paid_cents,
+      card_on_file, stripe_payment_status, fee_charged_cents, fee_type, stripe_customer_id,
+      staff:profiles!appointments_staff_id_fkey(id, full_name),
+      service:services!appointments_service_id_fkey(id, name, price_cents, duration_minutes)
+    `)
+    .eq('client_id', id)
+    .order('start_time', { ascending: false })
+    .limit(40);
+
+  if (apptError) return res.status(500).json({ error: apptError.message });
+
+  let appointments = appts || [];
+  try {
+    appointments = await attachItems(appointments);
+  } catch (e) {
+    console.error('Client summary: could not attach items:', e.message);
+  }
+
+  return res.json({
+    client: { ...profile, email },
+    forms: { waiver: latest.waiver || null, consultation: latest.consultation || null, all: forms || [] },
+    appointments,
+  });
 });
 
 // PUT /clients/:id — edit a client's name, phone, and email (admin only)

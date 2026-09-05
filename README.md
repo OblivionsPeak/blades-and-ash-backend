@@ -40,6 +40,13 @@ Node.js + Express backend for the Blades & Ash Studio salon booking platform. Ha
 | GET | /api/admin/appointments | Admin/Staff | All appointments (with filters) |
 | GET | /api/admin/clients | Admin | List all clients |
 | PUT | /api/admin/profiles/:id/role | Admin | Change user role |
+| GET | /api/forms/waiver-text | None | Current agreement text + version |
+| POST | /api/forms/waiver | Optional | Sign the client agreement / waiver (emails the client a copy) |
+| POST | /api/forms/consultation | Optional | Submit the pre-visit consultation form |
+| GET | /api/forms/mine | Auth | The signed-in client's latest waiver / consultation dates |
+| GET | /api/forms | Admin | List submissions (filter by kind, search, client_id) |
+| GET | /api/forms/:id | Admin | One submission in full, incl. signature |
+| DELETE | /api/forms/:id | Admin | Delete a submission |
 
 ## Setup Guide
 

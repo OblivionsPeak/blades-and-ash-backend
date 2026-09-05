@@ -13,6 +13,7 @@ import discountsRouter from './routes/discounts.js';
 import adminRouter from './routes/admin.js';
 import galleryRouter from './routes/gallery.js';
 import settingsRouter from './routes/settings.js';
+import formsRouter from './routes/forms.js';
 import { startReminderJob, processReminders } from './jobs/reminders.js';
 import { supabase } from './supabase.js';
 import { sendBookingConfirmation, sendOwnerBookingAlert } from './lib/email.js';
@@ -379,6 +380,10 @@ app.use('/api/appointments', (req, res, next) =>
 app.use('/api/discounts/validate', publicLimiter);
 // GET /api/availability (public slot lookup).
 app.use('/api/availability', publicLimiter);
+// POST /api/forms/* (public waiver signing + consultation submissions).
+app.use('/api/forms', (req, res, next) =>
+  req.method === 'POST' ? publicLimiter(req, res, next) : next()
+);
 
 // ──────────────────────────────────────────────
 // API Routes
@@ -392,6 +397,7 @@ app.use('/api/discounts', discountsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/gallery', galleryRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/forms', formsRouter);
 
 // Lightweight liveness probe: no DB, no auth. Point an uptime pinger
 // (e.g. UptimeRobot, every 5-10 min) here to keep the Render instance warm

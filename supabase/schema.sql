@@ -347,3 +347,34 @@ create table if not exists reminders (
 -- Reminders are only accessed server-side via the service role key (which
 -- bypasses RLS). Enable RLS with no policies to close the table to anon access.
 alter table reminders enable row level security;
+
+-- ──────────────────────────────────────────────────────────
+-- CLIENT FORMS (signed waivers + consultation intakes)
+-- ──────────────────────────────────────────────────────────
+-- One row per submission. client_id is set when the submitter was signed
+-- in and nulled (not cascaded) if that account is deleted: a signed
+-- waiver must outlive the account, so name/email/phone are copied here.
+create table if not exists client_forms (
+  id uuid primary key default gen_random_uuid(),
+  kind text not null check (kind in ('waiver', 'consultation')),
+  client_id uuid references profiles(id) on delete set null,
+  client_name text not null,
+  client_email text,
+  client_phone text,
+  data jsonb not null default '{}'::jsonb,
+  signature_data_url text,
+  agreement_version text,
+  ip text,
+  user_agent text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_client_forms_kind_created
+  on client_forms (kind, created_at desc);
+create index if not exists idx_client_forms_client
+  on client_forms (client_id, created_at desc);
+create index if not exists idx_client_forms_email
+  on client_forms (lower(client_email));
+
+-- Server-only (service role bypasses RLS); clients never read these directly.
+alter table client_forms enable row level security;

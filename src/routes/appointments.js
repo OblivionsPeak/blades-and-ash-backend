@@ -88,7 +88,7 @@ function isCardUsableAt(method, startTime) {
 // (joined to services for the name). For LEGACY appointments with no
 // appointment_services rows, synthesize a single item from the primary
 // `service` join so old bookings still render. Mutates and returns the input.
-async function attachItems(appointments) {
+export async function attachItems(appointments) {
   if (!appointments || appointments.length === 0) return appointments;
 
   const ids = appointments.map((a) => a.id);
